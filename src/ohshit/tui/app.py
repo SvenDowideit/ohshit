@@ -188,6 +188,7 @@ class OhShitApp(App[None]):
         time.sleep(0.5)
 
         # ── Step 1: load what's already in ohshit.db ────────────────────
+        self._thread_safe_progress("Vuln: loading cache…", 2)
         try:
             reader = DB.open_reader(self._db_path)
             cached = DB.load_vuln_cache(reader)
@@ -228,6 +229,7 @@ class OhShitApp(App[None]):
                     stale.append(ip)
 
         if not stale:
+            self._thread_safe_progress("Vuln: up to date", 100)
             return
 
         self._thread_safe_log(
@@ -236,6 +238,7 @@ class OhShitApp(App[None]):
         )
 
         # ── Step 3: refresh KEV catalog once ────────────────────────────
+        self._thread_safe_progress("Vuln: fetching KEV catalog…", 5)
         try:
             refresh_kev(log_cb=self._thread_safe_log)
             kev = kev_ids()
@@ -248,12 +251,14 @@ class OhShitApp(App[None]):
         asyncio.set_event_loop(loop)
         try:
             writer = DB.open_writer(self._db_path)
-            for ip in stale:
+            for idx, ip in enumerate(stale):
                 packages = self._sbom_packages.get(ip, [])
                 host = self._hosts.get(ip)
                 name = host.display_name if host else ip
                 if not packages:
                     continue
+                pct = 10 + int(idx / len(stale) * 85)
+                self._thread_safe_progress(f"Vuln: querying {name}…", pct)
                 try:
                     matches = loop.run_until_complete(
                         query_vulns_for_packages(packages, log_cb=self._thread_safe_log)
@@ -273,6 +278,7 @@ class OhShitApp(App[None]):
             writer.close()
         finally:
             loop.close()
+        self._thread_safe_progress("Vuln: done", 100)
 
     def _apply_vuln_findings(
         self,
@@ -462,16 +468,20 @@ class OhShitApp(App[None]):
             try:
                 from ..vuln_db import query_vulns_for_packages, refresh_kev, kev_ids
                 # Refresh KEV catalog first (fast, ~200 KB)
+                self._thread_safe_progress("Vuln: fetching KEV…", 5)
                 refresh_kev(log_cb=self._thread_safe_log)
                 # Then query OSV for this host's packages
+                name = host.display_name if host else ip
+                self._thread_safe_progress(f"Vuln: querying OSV for {name}…", 20)
                 matches = loop.run_until_complete(
                     query_vulns_for_packages(packages, log_cb=self._thread_safe_log)
                 )
                 total = sum(len(v) for v in matches.values())
                 self._thread_safe_log(
-                    f"[dim]Vuln:[/dim] {host.display_name if host else ip} — "
+                    f"[dim]Vuln:[/dim] {name} — "
                     f"{total} CVEs across {len(matches)} packages"
                 )
+                self._thread_safe_progress(f"Vuln: {name} — {total} CVEs", 90)
                 # Persist, update risk findings, refresh UI
                 self._vuln_matches[ip] = matches
                 kev = kev_ids()
@@ -481,9 +491,11 @@ class OhShitApp(App[None]):
                 DB.save_vuln_cache(writer, ip, matches)
                 writer.close()
                 DB.data_changed.set()
+                self._thread_safe_progress("Vuln: done", 100)
             except Exception as exc:
                 import traceback
                 self._thread_safe_log(f"[bold red]Vuln query error:[/bold red] {exc}")
+                self._thread_safe_progress("Vuln: error", 100)
             finally:
                 loop.close()
 

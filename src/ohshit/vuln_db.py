@@ -82,16 +82,19 @@ _ECOSYSTEMS_FOR_SOURCE: dict[str, list[str]] = {
 
 _SCHEMA = [
     """CREATE TABLE IF NOT EXISTS advisories (
-        id           TEXT PRIMARY KEY,
-        source       TEXT NOT NULL,       -- 'osv' or 'kev'
-        aliases_json TEXT NOT NULL DEFAULT '[]',
-        summary      TEXT NOT NULL DEFAULT '',
-        details      TEXT NOT NULL DEFAULT '',
-        severity     TEXT NOT NULL DEFAULT '',
-        cvss_score   REAL,
-        published    TIMESTAMPTZ,
-        modified     TIMESTAMPTZ,
-        raw_json     TEXT NOT NULL DEFAULT '{}'
+        id              TEXT PRIMARY KEY,
+        source          TEXT NOT NULL,       -- 'osv' or 'kev'
+        aliases_json    TEXT NOT NULL DEFAULT '[]',
+        summary         TEXT NOT NULL DEFAULT '',
+        details         TEXT NOT NULL DEFAULT '',
+        severity        TEXT NOT NULL DEFAULT '',
+        cvss_score      REAL,
+        published       TIMESTAMPTZ,
+        modified        TIMESTAMPTZ,
+        raw_json        TEXT NOT NULL DEFAULT '{}',
+        epss_score      REAL,
+        epss_percentile REAL,
+        ransomware      TEXT NOT NULL DEFAULT ''
     )""",
     """CREATE TABLE IF NOT EXISTS package_vulns (
         advisory_id  TEXT NOT NULL,
@@ -107,12 +110,26 @@ _SCHEMA = [
     )""",
 ]
 
+# Migrations for existing databases (idempotent ALTERs)
+# DuckDB does not support NOT NULL or DEFAULT in ALTER TABLE ADD COLUMN,
+# so these are nullable; code must treat NULL the same as empty/zero.
+_MIGRATIONS = [
+    "ALTER TABLE advisories ADD COLUMN IF NOT EXISTS epss_score REAL",
+    "ALTER TABLE advisories ADD COLUMN IF NOT EXISTS epss_percentile REAL",
+    "ALTER TABLE advisories ADD COLUMN IF NOT EXISTS ransomware TEXT",
+]
+
 
 def _open_cache() -> duckdb.DuckDBPyConnection:
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(str(_VULN_DB_PATH))
     for stmt in _SCHEMA:
         con.execute(stmt)
+    for stmt in _MIGRATIONS:
+        try:
+            con.execute(stmt)
+        except Exception:
+            pass  # column already exists
     return con
 
 
@@ -150,11 +167,12 @@ def _fetch_kev(con: duckdb.DuckDBPyConnection, log_cb=None) -> int:
         except ValueError:
             published = None
 
+        ransomware = v.get("knownRansomwareCampaignUse", "")
         try:
             con.execute(
                 """INSERT OR REPLACE INTO advisories
-                       (id, source, aliases_json, summary, details, severity, published, raw_json)
-                   VALUES (?, 'kev', ?, ?, ?, 'Critical', ?, ?)""",
+                       (id, source, aliases_json, summary, details, severity, published, raw_json, ransomware)
+                   VALUES (?, 'kev', ?, ?, ?, 'Critical', ?, ?, ?)""",
                 [
                     cve_id,
                     json.dumps([cve_id]),
@@ -162,6 +180,7 @@ def _fetch_kev(con: duckdb.DuckDBPyConnection, log_cb=None) -> int:
                     f"Due date for remediation: {due_date}" if due_date else "",
                     published,
                     json.dumps(v),
+                    ransomware,
                 ],
             )
             added += 1
@@ -367,8 +386,136 @@ async def _fetch_osv_batch(queries: list[dict], log_cb=None) -> list[tuple[dict,
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# EPSS (Exploit Prediction Scoring System)
 # ---------------------------------------------------------------------------
+
+_EPSS_URL = "https://api.first.org/data/v1/epss"
+_EPSS_BATCH_SIZE = 100  # API accepts comma-separated CVE IDs
+
+# Prefixes used by distro-specific OSV advisories that encode the CVE ID
+_OSV_CVE_PREFIXES = (
+    "DEBIAN-", "UBUNTU-CVE-", "RHSA-", "SUSE-CVE-", "ALAS-",
+)
+
+
+def _extract_cve_id(advisory_id: str) -> str | None:
+    """Return the canonical CVE-XXXX-XXXXX form from an advisory ID, or None."""
+    uid = advisory_id.upper()
+    if uid.startswith("CVE-"):
+        return advisory_id
+    # DEBIAN-CVE-2022-1234 → CVE-2022-1234
+    if uid.startswith("DEBIAN-CVE-"):
+        return advisory_id[len("DEBIAN-"):]
+    # UBUNTU-CVE-2022-1234 → CVE-2022-1234
+    if uid.startswith("UBUNTU-CVE-"):
+        return advisory_id[len("UBUNTU-"):]
+    # SUSE-CVE-2022-1234-1 → CVE-2022-1234  (strip trailing -1)
+    if uid.startswith("SUSE-CVE-"):
+        candidate = advisory_id[len("SUSE-"):]
+        # Remove trailing patch number if present
+        parts = candidate.split("-")
+        if len(parts) > 3 and parts[-1].isdigit():
+            candidate = "-".join(parts[:-1])
+        return candidate
+    return None
+
+
+async def fetch_epss(
+    advisory_ids: list[str],
+    log_cb=None,
+) -> None:
+    """Fetch EPSS scores from api.first.org and update the advisories table.
+
+    Accepts any mix of advisory IDs (CVE-*, DEBIAN-CVE-*, GHSA-*, etc.).
+    Derives canonical CVE IDs where possible, queries EPSS, then writes
+    scores back to both the original advisory row and any alias matches.
+    """
+    import aiohttp
+
+    # Build mapping: canonical_cve → set of original advisory IDs that map to it
+    cve_to_adv: dict[str, set[str]] = {}
+    for adv_id in advisory_ids:
+        cve = _extract_cve_id(adv_id)
+        if cve:
+            cve_to_adv.setdefault(cve, set()).add(adv_id)
+        # Also check if any alias is a CVE (passed through from match_packages_to_vulns)
+        # — callers should pass aliases separately if needed
+
+    cve_format = list(cve_to_adv.keys())
+    if not cve_format:
+        return
+
+    if log_cb:
+        log_cb(f"[dim]Vuln:[/dim] Fetching EPSS scores for {len(cve_format)} CVEs…")
+
+    scores: dict[str, tuple[float, float]] = {}  # cve_id → (epss, percentile)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            for i in range(0, len(cve_format), _EPSS_BATCH_SIZE):
+                batch = cve_format[i:i + _EPSS_BATCH_SIZE]
+                params = {"cve": ",".join(batch)}
+                try:
+                    async with session.get(
+                        _EPSS_URL,
+                        params=params,
+                        timeout=aiohttp.ClientTimeout(total=30),
+                    ) as resp:
+                        if resp.status == 200:
+                            body = await resp.json()
+                            for entry in body.get("data", []):
+                                cve = entry.get("cve", "")
+                                try:
+                                    epss = float(entry.get("epss", 0))
+                                    pct = float(entry.get("percentile", 0))
+                                    scores[cve] = (epss, pct)
+                                except (TypeError, ValueError):
+                                    pass
+                        else:
+                            text = await resp.text()
+                            if log_cb:
+                                log_cb(f"[dim red]Vuln:[/dim red] EPSS returned HTTP {resp.status}: {text[:200]}")
+                except Exception as exc:
+                    if log_cb:
+                        log_cb(f"[dim red]Vuln:[/dim red] EPSS batch request failed: {exc}")
+    except Exception as exc:
+        if log_cb:
+            log_cb(f"[dim red]Vuln:[/dim red] EPSS session error: {exc}")
+        return
+
+    if not scores:
+        return
+
+    # Write scores to DB: match by original advisory ID, by CVE ID, and by alias
+    con = _open_cache()
+    try:
+        for cve_id, (epss, pct) in scores.items():
+            # Update rows whose id IS the CVE, or whose aliases contain it,
+            # or whose id can be derived to this CVE (e.g. DEBIAN-CVE-*)
+            original_adv_ids = cve_to_adv.get(cve_id, set())
+            ids_to_update = original_adv_ids | {cve_id}
+            for adv_id in ids_to_update:
+                try:
+                    con.execute(
+                        "UPDATE advisories SET epss_score = ?, epss_percentile = ? WHERE id = ?",
+                        [epss, pct, adv_id],
+                    )
+                except Exception:
+                    pass
+            # Also catch any rows that have this CVE in their aliases_json
+            try:
+                con.execute(
+                    """UPDATE advisories SET epss_score = ?, epss_percentile = ?
+                       WHERE epss_score IS NULL AND aliases_json LIKE ?""",
+                    [epss, pct, f'%"{cve_id}"%'],
+                )
+            except Exception:
+                pass
+    finally:
+        con.close()
+
+    if log_cb:
+        log_cb(f"[dim]Vuln:[/dim] EPSS: scores updated for {len(scores)} CVEs")
 
 def refresh_kev(log_cb=None) -> int:
     """Sync the CISA KEV catalog into the local vuln cache. Returns count stored."""
@@ -412,7 +559,24 @@ async def query_vulns_for_packages(
     if log_cb and stored > 0:
         log_cb(f"[dim]Vuln:[/dim] OSV: {stored} advisories cached")
 
-    # Collate matching advisories from cache
+    # Fetch EPSS scores for all matched advisories
+    matched = match_packages_to_vulns(packages)
+    all_adv_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for advisories in matched.values():
+        for adv in advisories:
+            adv_id = adv.get("id", "")
+            if adv_id and adv_id not in seen_ids:
+                seen_ids.add(adv_id)
+                all_adv_ids.append(adv_id)
+            for alias in adv.get("aliases", []):
+                if alias and alias not in seen_ids:
+                    seen_ids.add(alias)
+                    all_adv_ids.append(alias)
+    if all_adv_ids:
+        await fetch_epss(all_adv_ids, log_cb=log_cb)
+
+    # Re-read to pick up EPSS scores
     return match_packages_to_vulns(packages)
 
 
@@ -427,6 +591,16 @@ def match_packages_to_vulns(packages: list[dict]) -> dict[str, list[dict]]:
 
     con = _open_cache()
     try:
+        # Pre-load KEV index: id → ransomware, plus aliases → ransomware
+        kev_by_cve: dict[str, str] = {}
+        for row in con.execute(
+            "SELECT id, aliases_json, ransomware FROM advisories WHERE source='kev'"
+        ).fetchall():
+            kev_id, aliases_json, ransomware = row
+            kev_by_cve[kev_id] = ransomware or ""
+            for alias in json.loads(aliases_json or "[]"):
+                kev_by_cve[alias] = ransomware or ""
+
         results: dict[str, list[dict]] = {}
         for pkg in packages:
             source = pkg.get("source", "")
@@ -440,7 +614,8 @@ def match_packages_to_vulns(packages: list[dict]) -> dict[str, list[dict]]:
             for eco in ecosystems:
                 rows = con.execute(
                     """SELECT DISTINCT a.id, a.source, a.aliases_json, a.summary,
-                              a.severity, a.cvss_score, a.published
+                              a.severity, a.cvss_score, a.published,
+                              a.epss_score, a.epss_percentile, a.ransomware
                        FROM package_vulns pv
                        JOIN advisories a ON a.id = pv.advisory_id
                        WHERE pv.ecosystem = ? AND pv.pkg_name = ?
@@ -448,15 +623,41 @@ def match_packages_to_vulns(packages: list[dict]) -> dict[str, list[dict]]:
                     [eco, name],
                 ).fetchall()
                 for row in rows:
-                    adv_id, adv_source, aliases_json, summary, sev, cvss, pub = row
+                    adv_id, adv_source, aliases_json, summary, sev, cvss, pub, epss, epss_pct, ransomware = row
+                    aliases = json.loads(aliases_json or "[]")
+
+                    # Cross-reference KEV: check the advisory ID, its aliases, and
+                    # any CVE derived from a distro-prefixed ID (DEBIAN-CVE-*, etc.)
+                    in_kev = adv_id in kev_by_cve or any(a in kev_by_cve for a in aliases)
+                    if not in_kev:
+                        derived_cve = _extract_cve_id(adv_id)
+                        if derived_cve and derived_cve in kev_by_cve:
+                            in_kev = True
+
+                    # Determine effective ransomware status from KEV cross-ref
+                    effective_ransomware = ransomware or ""
+                    if not effective_ransomware:
+                        for check_id in [adv_id] + aliases + ([_extract_cve_id(adv_id)] if _extract_cve_id(adv_id) else []):
+                            if check_id and check_id in kev_by_cve:
+                                effective_ransomware = kev_by_cve[check_id]
+                                break
+
+                    # For distro-prefixed OSV IDs with no severity, try to derive from KEV
+                    effective_sev = sev
+                    if not effective_sev and in_kev:
+                        effective_sev = "Critical"
+
                     advisories.append({
                         "id": adv_id,
-                        "source": adv_source,
-                        "aliases": json.loads(aliases_json or "[]"),
+                        "source": "kev" if in_kev else adv_source,
+                        "aliases": aliases,
                         "summary": summary,
-                        "severity": sev,
+                        "severity": effective_sev,
                         "cvss_score": cvss,
                         "published": pub,
+                        "epss_score": epss,
+                        "epss_percentile": epss_pct,
+                        "ransomware": effective_ransomware,
                     })
             if advisories:
                 # Deduplicate by advisory id

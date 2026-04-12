@@ -582,7 +582,7 @@ class VulnTab(Widget):
 
     def on_mount(self) -> None:
         tbl = self.query_one("#vuln-table", DataTable)
-        tbl.add_columns("ID", "KEV", "Severity", "CVSS", "Package", "Summary")
+        tbl.add_columns("ID", "Exploit", "Severity", "CVSS", "EPSS%", "Package", "Summary")
         tbl.cursor_type = "row"
 
     def update_vulns(
@@ -617,12 +617,12 @@ class VulnTab(Widget):
         # Sort: packages with most vulns first
         rows.sort(key=lambda r: len(r[3]), reverse=True)
 
-        try:
-            kev = _kev_ids_cached()
-        except Exception:
-            kev = frozenset()
+        _SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4, "": 4}
 
+        # Collect all advisory rows, then sort by exploitation risk
+        adv_rows: list[tuple] = []  # (sort_key, display_fields...)
         seen_adv: set[str] = set()
+
         for _, pkg_name, pkg_ver, advisories in rows:
             for adv in advisories:
                 adv_id = adv.get("id", "")
@@ -630,29 +630,67 @@ class VulnTab(Widget):
                     continue
                 seen_adv.add(adv_id)
 
-                in_kev = "★" if adv_id in kev or any(a in kev for a in adv.get("aliases", [])) else ""
+                # source='kev' is set by match_packages_to_vulns when the advisory
+                # (or its derived CVE) is in the CISA KEV catalog
+                in_kev = adv.get("source") == "kev"
+                ransomware = (adv.get("ransomware") or "").lower() == "known"
                 sev = adv.get("severity") or "Unknown"
+                sev_order = _SEV_ORDER.get(sev.lower(), 4)
                 cvss = adv.get("cvss_score")
-                cvss_str = f"{cvss:.1f}" if cvss is not None else ""
-                summary = (adv.get("summary") or "")[:80]
+                epss = adv.get("epss_score")
+                epss_pct = adv.get("epss_percentile")
 
-                sev_style = {
-                    "Critical": "bold white on red",
-                    "High": "bold black on yellow",
-                    "Medium": "black on dark_orange3",
-                    "Low": "black on green",
-                }.get(sev.capitalize(), "")
-
-                tbl.add_row(
-                    adv_id,
-                    Text(in_kev, style="bold red") if in_kev else "",
-                    Text(sev, style=sev_style) if sev_style else sev,
-                    cvss_str,
-                    f"{pkg_name} {pkg_ver}".strip(),
-                    summary,
+                # Sort key: KEV first, then ransomware, then EPSS percentile desc,
+                # then severity, then CVSS desc
+                sort_key = (
+                    0 if in_kev else 1,
+                    0 if ransomware else 1,
+                    -(epss_pct or 0.0),
+                    sev_order,
+                    -(cvss or 0.0),
                 )
+                adv_rows.append((
+                    sort_key,
+                    adv_id, in_kev, ransomware, sev, cvss, epss, epss_pct,
+                    f"{pkg_name} {pkg_ver}".strip(),
+                    adv.get("summary") or "",
+                ))
+
+        adv_rows.sort(key=lambda r: r[0])
+
+        for row in adv_rows:
+            (_, adv_id, in_kev, ransomware, sev, cvss, epss, epss_pct,
+             pkg_label, summary) = row
+
+            # Exploit indicator column: ★ KEV + 🦠 ransomware
+            exploit_parts: list[str] = []
+            if in_kev:
+                exploit_parts.append("★")
+            if ransomware:
+                exploit_parts.append("R")
+            exploit_str = " ".join(exploit_parts)
+
+            epss_str = f"{epss * 100:.1f}%" if epss is not None else ""
+            cvss_str = f"{cvss:.1f}" if cvss is not None else ""
+            summary_str = summary[:80]
+
+            sev_style = {
+                "Critical": "bold white on red",
+                "High": "bold black on yellow",
+                "Medium": "black on dark_orange3",
+                "Low": "black on green",
+            }.get(sev.capitalize(), "")
+
+            exploit_style = "bold red" if in_kev or ransomware else ""
+
+            tbl.add_row(
+                adv_id,
+                Text(exploit_str, style=exploit_style) if exploit_str else "",
+                Text(sev, style=sev_style) if sev_style else sev,
+                cvss_str,
+                Text(epss_str, style="bold yellow" if epss is not None and epss >= 0.1 else "") if epss_str else "",
+                pkg_label,
+                summary_str,
+            )
 
 
-def _kev_ids_cached() -> frozenset:
-    from ..vuln_db import kev_ids
-    return kev_ids()

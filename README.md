@@ -209,7 +209,8 @@ to force an immediate re-query for the selected host.
 | Source | What it covers | Auth required |
 |--------|---------------|---------------|
 | [OSV](https://osv.dev/) (Google) | Debian, Ubuntu, PyPI, Red Hat, openSUSE, Alpine, Rocky Linux, AlmaLinux, Fedora, npm, Cargo, Go, RubyGems, NuGet, and 30+ more ecosystems | None |
-| [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) (CISA) | ~1,500 CVEs with confirmed active exploitation in the wild | None |
+| [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) (CISA) | ~1,500 CVEs with confirmed active exploitation in the wild; includes ransomware campaign indicator | None |
+| [EPSS](https://www.first.org/epss/) (FIRST.org) | Exploit Prediction Scoring System — probability (0–1) and percentile that a CVE will be exploited in the wild within 30 days | None |
 
 Snap, Flatpak, and container image tags are not indexed by OSV and produce no
 results.
@@ -236,7 +237,7 @@ On startup the tool:
 3. Quietly refreshes those hosts in a background thread, logging each result
    to the log panel
 
-The raw advisory data (advisory IDs, CVSS scores, summaries) is cached
+The raw advisory data (advisory IDs, CVSS scores, EPSS scores, summaries) is cached
 separately in `~/.cache/ohshit/vuln.duckdb`, shared across all projects.
 
 #### Display
@@ -244,10 +245,14 @@ separately in `~/.cache/ohshit/vuln.duckdb`, shared across all projects.
 - **SBOM tab** — `CVEs` column (first column, shown in red when non-zero)
   shows the count of matching advisories per package. Packages are sorted by:
   KEV hits first → worst CVE severity → CVE count → newest release date.
-- **Vulnerabilities tab** — full advisory table with advisory ID, a `★` badge
-  for entries in the CISA KEV catalog (actively exploited), severity, CVSS
-  score, affected package, and summary text. Packages with the most CVEs are
-  listed first.
+- **Vulnerabilities tab** — full advisory table sorted by exploitation risk:
+  actively exploited (KEV) first, then known ransomware campaigns (`R`), then
+  highest EPSS probability, then severity, then CVSS score.
+  - `Exploit` column: `★` = in CISA KEV catalog (confirmed active exploitation);
+    `R` = associated with known ransomware campaigns; `★ R` = both.
+  - `EPSS%` column: probability of exploitation in the wild within 30 days
+    (highlighted in yellow when ≥10%).
+  - `CVSS` column: numeric severity score from the advisory.
 
 ### 7 — Dashboard
 
