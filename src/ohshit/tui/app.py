@@ -49,6 +49,14 @@ from ..models import Host, IotInfo, ScanResult, Severity
 from ..port_probe import probe_ports
 from ..report import generate_markdown_report
 from ..risk_engine import RiskEngine
+from ..sbom import (
+    collect_packages_from_raw,
+    load_latest_packages,
+    open_catalog,
+    register_sbom_in_catalog,
+    should_collect_sbom,
+    write_sbom,
+)
 from ..ssh_collector import collect_all, _apply_os_release
 from .widgets import (
     FindingsTable,
@@ -56,6 +64,7 @@ from .widgets import (
     HostListPanel,
     LogFeed,
     RemediationPanel,
+    SbomTab,
     ScanProgressBar,
 )
 
@@ -98,6 +107,10 @@ class OhShitApp(App[None]):
         self._reader: Any = None
         # Cache of last-loaded hosts so selection survives refreshes
         self._hosts: dict[str, Host] = {}
+        # DuckLake SBOM catalog connection (UI thread)
+        self._sbom_catalog: Any = None
+        # Cache: ip -> list[dict] packages for the SBOM tab
+        self._sbom_packages: dict[str, list[dict]] = {}
 
     # ------------------------------------------------------------------
     # Layout
@@ -115,6 +128,8 @@ class OhShitApp(App[None]):
                         yield FindingsTable(id="findings-table")
                     with TabPane("Remediation", id="tab-remediation"):
                         yield RemediationPanel(id="remediation-panel")
+                    with TabPane("SBOM", id="tab-sbom"):
+                        yield SbomTab(id="sbom-tab")
         with Vertical(id="bottom-panel"):
             yield ScanProgressBar(id="scan-progress")
             yield LogFeed(id="log-feed")
@@ -130,6 +145,13 @@ class OhShitApp(App[None]):
         threading.Thread(target=self._refresh_oui_cache, daemon=True, name="oui-cache").start()
         # Open reader connection
         self._reader = DB.open_reader(self._db_path)
+        # Open SBOM catalog
+        try:
+            self._sbom_catalog = open_catalog(self._db_path.parent)
+        except Exception as exc:
+            self._sbom_catalog = None
+            # Log after mount completes
+            self.call_after_refresh(lambda: self._log(f"[yellow]SBOM catalog unavailable: {exc}[/yellow]"))
         # Load whatever is already in the DB immediately
         self._poll_db()
         self._log(f"Database: [bold]{self._db_path}[/bold]")
@@ -148,6 +170,11 @@ class OhShitApp(App[None]):
         if self._reader:
             try:
                 self._reader.close()
+            except Exception:
+                pass
+        if self._sbom_catalog:
+            try:
+                self._sbom_catalog.close()
             except Exception:
                 pass
 
@@ -174,9 +201,29 @@ class OhShitApp(App[None]):
             self._hosts = DB.load_all_hosts(self._reader)
             summary = DB.load_scan_summary(self._reader)
             self._update_subtitle(summary)
+            # Refresh SBOM packages from catalog
+            self._refresh_sbom_cache()
             self.call_after_refresh(self._refresh_panels_sync)
         except Exception as exc:
             self._log(f"[dim red]DB poll error: {exc}[/dim red]")
+
+    def _refresh_sbom_cache(self) -> None:
+        """Load latest SBOM packages from the DuckLake catalog into the cache."""
+        if not self._sbom_catalog:
+            return
+        try:
+            # Re-open catalog each poll so it sees new SBOM databases
+            self._sbom_catalog.close()
+            self._sbom_catalog = open_catalog(self._db_path.parent)
+            all_packages = load_latest_packages(self._sbom_catalog)
+            # Index by IP
+            by_ip: dict[str, list[dict]] = {}
+            for pkg in all_packages:
+                ip = pkg["ip"]
+                by_ip.setdefault(ip, []).append(pkg)
+            self._sbom_packages = by_ip
+        except Exception:
+            pass
 
     def _update_subtitle(self, summary: dict[str, Any]) -> None:
         total = summary["total_hosts"]
@@ -216,6 +263,10 @@ class OhShitApp(App[None]):
         self.query_one("#host-detail", HostDetailTab).update_host(host)
         self.query_one("#findings-table", FindingsTable).update_host(host)
         await self.query_one("#remediation-panel", RemediationPanel).update_host(host)
+        # SBOM tab — load from cached packages dict
+        sbom_widget = self.query_one("#sbom-tab", SbomTab)
+        packages = self._sbom_packages.get(host.ip, [])
+        sbom_widget.update_sbom(packages, host)
 
     # ------------------------------------------------------------------
     # Actions
@@ -345,6 +396,14 @@ async def _scanner_async(
     """Full scan pipeline.  Writes to DB as each host is processed."""
     writer = DB.open_writer(db_path)
     risk_engine = RiskEngine()
+    sbom_base = db_path.parent
+
+    # Open SBOM catalog in scanner thread (separate connection from UI thread)
+    try:
+        sbom_catalog = open_catalog(sbom_base)
+    except Exception as exc:
+        sbom_catalog = None
+        log_cb(f"[yellow]SBOM catalog unavailable: {exc}[/yellow]")
 
     def prog(step: str, pct: int) -> None:
         progress_cb(step, pct)
@@ -443,6 +502,26 @@ async def _scanner_async(
             if raw:
                 _apply_os_release(host, raw)
                 host.last_scan = datetime.now()
+                # Collect SBOM from SSH data (only if needed)
+                host_id = host.mac or host.ip
+                if sbom_catalog and should_collect_sbom(sbom_base, host_id):
+                    packages = collect_packages_from_raw(raw)
+                    if packages:
+                        collected_at = datetime.now()
+                        sbom_path = write_sbom(
+                            sbom_base, host_id, packages,
+                            ip=host.ip,
+                            hostname=host.hostname,
+                            collected_at=collected_at,
+                        )
+                        register_sbom_in_catalog(
+                            sbom_catalog, host_id, host.ip,
+                            host.hostname, collected_at, sbom_path, len(packages),
+                        )
+                        log_cb(
+                            f"[dim]SBOM:[/dim] {host.display_name} — "
+                            f"{len(packages)} packages → {sbom_path.name}"
+                        )
 
         # For hosts where SSH didn't run or failed, do a TCP connect scan
         # to populate open_ports (nmap may have already done this during
@@ -476,6 +555,11 @@ async def _scanner_async(
 
     DB.finish_scan_log(writer, scan_id, len(result.hosts))
     writer.close()
+    if sbom_catalog:
+        try:
+            sbom_catalog.close()
+        except Exception:
+            pass
 
     log_cb(
         f"[bold]Scan complete.[/bold] {total} hosts  |  "

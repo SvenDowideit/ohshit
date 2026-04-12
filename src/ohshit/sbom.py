@@ -1,0 +1,428 @@
+"""SBOM (Software Bill of Materials) collection and storage.
+
+Design
+------
+- Each SBOM collection for a host is stored in its own DuckDB file:
+    sbom/<host_id>/<timestamp>.duckdb
+  where host_id is the MAC address (preferred) or IP (fallback).
+
+- A DuckLake catalog (sbom_catalog.ducklake) provides a unified view
+  across all per-host SBOM databases. Under normal operation only the
+  latest SBOM for each host is surfaced. Historical databases are kept
+  for comparison/archaeology but never re-collected unless forced.
+
+- SBOM collection sources:
+    dpkg/apt  — Debian/Ubuntu systems
+    rpm       — Red Hat/Fedora/SUSE systems
+    snap      — Snap packages
+    flatpak   — Flatpak packages
+    pip3      — System Python packages
+    docker    — Running container images (from docker ps / docker images)
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import duckdb
+
+
+@dataclass
+class SbomPackage:
+    name: str
+    version: str
+    source: str          # "dpkg", "rpm", "snap", "flatpak", "pip", "docker"
+    package_type: str    # "deb", "rpm", "snap", "flatpak", "python", "container"
+    arch: str = ""
+
+
+_SBOM_SCHEMA = [
+    """CREATE TABLE IF NOT EXISTS packages (
+        name         TEXT NOT NULL,
+        version      TEXT NOT NULL,
+        source       TEXT NOT NULL,
+        package_type TEXT NOT NULL,
+        arch         TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (name, source)
+    )""",
+    """CREATE TABLE IF NOT EXISTS metadata (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )""",
+]
+
+
+def _sbom_dir(base_dir: Path) -> Path:
+    d = base_dir / "sbom"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _host_dir(base_dir: Path, host_id: str) -> Path:
+    # Sanitise MAC/IP for use as directory name
+    safe = re.sub(r"[^a-zA-Z0-9._-]", "_", host_id)
+    d = _sbom_dir(base_dir) / safe
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def latest_sbom_path(base_dir: Path, host_id: str) -> Path | None:
+    """Return path to the most recent SBOM database for this host, or None."""
+    hdir = _host_dir(base_dir, host_id)
+    dbs = sorted(hdir.glob("*.duckdb"), reverse=True)
+    return dbs[0] if dbs else None
+
+
+def all_sbom_paths(base_dir: Path, host_id: str) -> list[Path]:
+    """Return all SBOM database paths for this host, newest first."""
+    hdir = _host_dir(base_dir, host_id)
+    return sorted(hdir.glob("*.duckdb"), reverse=True)
+
+
+def write_sbom(
+    base_dir: Path,
+    host_id: str,
+    packages: list[SbomPackage],
+    ip: str,
+    hostname: str | None,
+    collected_at: datetime | None = None,
+) -> Path:
+    """Write a new SBOM database for a host. Returns the path written."""
+    ts = (collected_at or datetime.now()).strftime("%Y%m%dT%H%M%S")
+    hdir = _host_dir(base_dir, host_id)
+    db_path = hdir / f"{ts}.duckdb"
+
+    con = duckdb.connect(str(db_path))
+    for stmt in _SBOM_SCHEMA:
+        con.execute(stmt)
+
+    con.execute("DELETE FROM packages")
+    for pkg in packages:
+        con.execute(
+            "INSERT INTO packages (name, version, source, package_type, arch) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [pkg.name, pkg.version, pkg.source, pkg.package_type, pkg.arch],
+        )
+
+    # Store collection metadata
+    meta = {
+        "ip": ip,
+        "hostname": hostname or "",
+        "host_id": host_id,
+        "collected_at": (collected_at or datetime.now()).isoformat(),
+        "package_count": str(len(packages)),
+    }
+    con.execute("DELETE FROM metadata")
+    for k, v in meta.items():
+        con.execute(
+            "INSERT INTO metadata (key, value) VALUES (?, ?)",
+            [k, v],
+        )
+
+    con.close()
+    return db_path
+
+
+def should_collect_sbom(base_dir: Path, host_id: str, max_age_hours: float = 24.0) -> bool:
+    """Return True if no SBOM exists for this host or the latest is too old."""
+    path = latest_sbom_path(base_dir, host_id)
+    if path is None:
+        return True
+    # Parse timestamp from filename (YYYYMMDDTHHMMSS.duckdb)
+    stem = path.stem
+    try:
+        ts = datetime.strptime(stem, "%Y%m%dT%H%M%S")
+        age_hours = (datetime.now() - ts).total_seconds() / 3600
+        return age_hours > max_age_hours
+    except ValueError:
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Parsing functions — convert raw SSH output into SbomPackage lists
+# ---------------------------------------------------------------------------
+
+def parse_dpkg(raw: str) -> list[SbomPackage]:
+    """Parse dpkg-query -W output: name\tversion\tarch per line."""
+    pkgs = []
+    for line in raw.splitlines():
+        parts = line.strip().split("\t")
+        if len(parts) >= 2 and parts[0] and parts[1]:
+            pkgs.append(SbomPackage(
+                name=parts[0],
+                version=parts[1],
+                source="dpkg",
+                package_type="deb",
+                arch=parts[2] if len(parts) >= 3 else "",
+            ))
+    return pkgs
+
+
+def parse_rpm(raw: str) -> list[SbomPackage]:
+    """Parse rpm -qa output: name\tversion-release\tarch per line."""
+    pkgs = []
+    for line in raw.splitlines():
+        parts = line.strip().split("\t")
+        if len(parts) >= 2 and parts[0] and parts[1]:
+            pkgs.append(SbomPackage(
+                name=parts[0],
+                version=parts[1],
+                source="rpm",
+                package_type="rpm",
+                arch=parts[2] if len(parts) >= 3 else "",
+            ))
+    return pkgs
+
+
+def parse_snap(raw: str) -> list[SbomPackage]:
+    """Parse snap list output."""
+    pkgs = []
+    lines = raw.splitlines()
+    # Skip header line
+    for line in lines[1:]:
+        parts = line.split()
+        if len(parts) >= 2:
+            pkgs.append(SbomPackage(
+                name=parts[0],
+                version=parts[1],
+                source="snap",
+                package_type="snap",
+            ))
+    return pkgs
+
+
+def parse_flatpak(raw: str) -> list[SbomPackage]:
+    """Parse flatpak list --columns=application,version,origin output."""
+    pkgs = []
+    for line in raw.splitlines():
+        parts = line.strip().split("\t")
+        if not parts or not parts[0]:
+            continue
+        # May be tab or variable-space separated
+        if len(parts) < 2:
+            parts = line.split()
+        if len(parts) >= 2:
+            pkgs.append(SbomPackage(
+                name=parts[0],
+                version=parts[1] if len(parts) > 1 else "",
+                source="flatpak",
+                package_type="flatpak",
+            ))
+    return pkgs
+
+
+def parse_pip_freeze(raw: str) -> list[SbomPackage]:
+    """Parse pip freeze output: name==version."""
+    pkgs = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith("-"):
+            continue
+        if "==" in line:
+            name, _, version = line.partition("==")
+            pkgs.append(SbomPackage(
+                name=name.strip(),
+                version=version.strip(),
+                source="pip",
+                package_type="python",
+            ))
+    return pkgs
+
+
+def parse_docker_images(raw: str) -> list[SbomPackage]:
+    """Parse docker images output into SbomPackage entries."""
+    pkgs = []
+    lines = raw.splitlines()
+    for line in lines[1:]:
+        parts = line.split()
+        if len(parts) >= 3:
+            repo = parts[0]
+            tag = parts[1]
+            image_id = parts[2]
+            if repo == "<none>":
+                name = image_id
+                version = "untagged"
+            else:
+                name = repo
+                version = tag
+            pkgs.append(SbomPackage(
+                name=name,
+                version=version,
+                source="docker",
+                package_type="container",
+            ))
+    return pkgs
+
+
+def collect_packages_from_raw(raw: dict[str, Any]) -> list[SbomPackage]:
+    """Extract all packages from a raw SSH collection dict."""
+    all_pkgs: list[SbomPackage] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_unique(pkgs: list[SbomPackage]) -> None:
+        for p in pkgs:
+            key = (p.name, p.source)
+            if key not in seen:
+                seen.add(key)
+                all_pkgs.append(p)
+
+    if raw.get("sbom_dpkg"):
+        add_unique(parse_dpkg(raw["sbom_dpkg"]))
+    if raw.get("sbom_rpm"):
+        add_unique(parse_rpm(raw["sbom_rpm"]))
+    if raw.get("sbom_snap"):
+        add_unique(parse_snap(raw["sbom_snap"]))
+    if raw.get("sbom_flatpak"):
+        add_unique(parse_flatpak(raw["sbom_flatpak"]))
+    if raw.get("sbom_pip"):
+        add_unique(parse_pip_freeze(raw["sbom_pip"]))
+    if raw.get("sbom_pip_user"):
+        add_unique(parse_pip_freeze(raw["sbom_pip_user"]))
+    if raw.get("docker_images"):
+        add_unique(parse_docker_images(raw["docker_images"]))
+
+    return all_pkgs
+
+
+# ---------------------------------------------------------------------------
+# DuckLake catalog — unified read-only view
+# ---------------------------------------------------------------------------
+
+_CATALOG_SCHEMA = [
+    """CREATE TABLE IF NOT EXISTS sbom_index (
+        host_id      TEXT NOT NULL,
+        ip           TEXT NOT NULL,
+        hostname     TEXT NOT NULL DEFAULT '',
+        collected_at TIMESTAMPTZ NOT NULL,
+        db_path      TEXT NOT NULL,
+        package_count INTEGER NOT NULL DEFAULT 0,
+        is_latest    BOOLEAN NOT NULL DEFAULT TRUE
+    )""",
+]
+
+
+def _ensure_catalog_schema(con: duckdb.DuckDBPyConnection) -> None:
+    for stmt in _CATALOG_SCHEMA:
+        con.execute(stmt)
+
+
+def open_catalog(base_dir: Path) -> duckdb.DuckDBPyConnection:
+    """Open the DuckLake catalog, installing and loading the extension."""
+    catalog_path = _sbom_dir(base_dir) / "sbom_catalog.ducklake"
+    data_dir = _sbom_dir(base_dir) / "catalog_data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    con = duckdb.connect(":memory:")
+    con.execute("INSTALL ducklake")
+    con.execute("LOAD ducklake")
+    con.execute(
+        f"ATTACH 'ducklake:{catalog_path}' AS sbom_lake (DATA_PATH '{data_dir}')"
+    )
+    con.execute("USE sbom_lake")
+    _ensure_catalog_schema(con)
+    return con
+
+
+def register_sbom_in_catalog(
+    catalog_con: duckdb.DuckDBPyConnection,
+    host_id: str,
+    ip: str,
+    hostname: str | None,
+    collected_at: datetime,
+    db_path: Path,
+    package_count: int,
+) -> None:
+    """Record a new SBOM database in the catalog and mark previous as not latest."""
+    # Mark all prior entries for this host as not latest
+    catalog_con.execute(
+        "UPDATE sbom_index SET is_latest = FALSE WHERE host_id = ?",
+        [host_id],
+    )
+    # Check if this exact entry already exists (idempotent)
+    existing = catalog_con.execute(
+        "SELECT COUNT(*) FROM sbom_index WHERE host_id = ? AND collected_at = ?",
+        [host_id, collected_at],
+    ).fetchone()
+    if existing and existing[0] > 0:
+        catalog_con.execute(
+            "UPDATE sbom_index SET is_latest = TRUE, ip = ?, hostname = ?, db_path = ?, package_count = ? "
+            "WHERE host_id = ? AND collected_at = ?",
+            [ip, hostname or "", str(db_path), package_count, host_id, collected_at],
+        )
+    else:
+        catalog_con.execute(
+            """INSERT INTO sbom_index
+                   (host_id, ip, hostname, collected_at, db_path, package_count, is_latest)
+               VALUES (?, ?, ?, ?, ?, ?, TRUE)""",
+            [host_id, ip, hostname or "", collected_at, str(db_path), package_count],
+        )
+
+
+def load_latest_packages(
+    catalog_con: duckdb.DuckDBPyConnection,
+    ip: str | None = None,
+) -> list[dict]:
+    """Load packages from the latest SBOM for each host (or a specific host)."""
+    # Get the latest db_path for each host
+    where = "WHERE is_latest = TRUE"
+    params: list = []
+    if ip:
+        where += " AND ip = ?"
+        params.append(ip)
+
+    index_rows = catalog_con.execute(
+        f"SELECT host_id, ip, hostname, collected_at, db_path, package_count FROM sbom_index {where}",
+        params,
+    ).fetchall()
+
+    results = []
+    for host_id, row_ip, hostname, collected_at, db_path, pkg_count in index_rows:
+        db = Path(db_path)
+        if not db.exists():
+            continue
+        try:
+            hcon = duckdb.connect(str(db), read_only=True)
+            pkgs = hcon.execute(
+                "SELECT name, version, source, package_type, arch FROM packages ORDER BY source, name"
+            ).fetchall()
+            hcon.close()
+            for name, version, source, package_type, arch in pkgs:
+                results.append({
+                    "host_id": host_id,
+                    "ip": row_ip,
+                    "hostname": hostname,
+                    "collected_at": collected_at,
+                    "name": name,
+                    "version": version,
+                    "source": source,
+                    "package_type": package_type,
+                    "arch": arch,
+                })
+        except Exception:
+            pass
+    return results
+
+
+def load_sbom_summary(
+    catalog_con: duckdb.DuckDBPyConnection,
+) -> list[dict]:
+    """Return per-host SBOM summary (latest only)."""
+    rows = catalog_con.execute(
+        """SELECT host_id, ip, hostname, collected_at, package_count
+           FROM sbom_index
+           WHERE is_latest = TRUE
+           ORDER BY ip"""
+    ).fetchall()
+    return [
+        {
+            "host_id": r[0],
+            "ip": r[1],
+            "hostname": r[2],
+            "collected_at": r[3],
+            "package_count": r[4],
+        }
+        for r in rows
+    ]

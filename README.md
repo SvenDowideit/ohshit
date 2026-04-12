@@ -1,12 +1,12 @@
 # oh-shit
 
 A terminal dashboard that scans your home network, SSH-spiders into reachable
-hosts, and gives you a live view of security risks, severity scores, and
-remediation steps.
+hosts, and gives you a live view of security risks, severity scores, remediation
+steps, and a full Software Bill of Materials (SBOM) for every host.
 
 ```
 ┌─ Oh-Shit Network Security Dashboard ──────────── High risk (score 22) ─┐
-│ Hosts          │ Host Details  │ Findings  │ Remediation               │
+│ Hosts          │ Host Details  │ Findings  │ Remediation  │ SBOM        │
 │                │                                                        │
 │ CRIT router    │  192.168.1.1 (router) — Critical risk (score 32)      │
 │ HIGH myserver  │  OS: OpenWrt 23.05                                     │
@@ -20,7 +20,7 @@ remediation steps.
 │────────────────────────────────────────────────────────────────────────│
 │ [SSH: myserver]                                              [████  80%]│
 │ 14:32:07 Discovery done: 8 hosts found                                  │
-└────────────────── r:Re-scan  s:Re-scan host  e:Export  q:Quit ─────────┘
+└────────────── r:Re-scan  s:Re-scan host  e:Export  q:Quit ─────────────┘
 ```
 
 ## Quick start
@@ -79,7 +79,7 @@ with `--subnet 192.168.1.0/24` if needed.
 ### 2 — SSH collection
 
 For each reachable host, the tool connects with your existing SSH key or agent
-(`SSH_AUTH_SOCK`) and runs ~13 read-only commands concurrently:
+(`SSH_AUTH_SOCK`) and runs read-only commands concurrently:
 
 - OS and kernel version
 - Running systemd services
@@ -90,6 +90,7 @@ For each reachable host, the tool connects with your existing SSH key or agent
 - Docker containers and images
 - User accounts and sudo membership
 - Shadow file readability
+- Package inventory for SBOM (see below)
 
 Up to 5 hosts are collected in parallel. Hosts that are unreachable or reject
 the key are marked **SSH Failed** and shown without findings.
@@ -98,7 +99,25 @@ the key are marked **SSH Failed** and shown without findings.
 > re-imaged LAN devices don't block scans. Enable strict checking with
 > `ohshit --strict-host-keys`.
 
-### 3 — Risk scoring
+### 3 — Passive IoT detection
+
+Before per-host SSH collection, the tool listens passively on the LAN for
+device announcements:
+
+- **mDNS / Bonjour** — captures device names and service types advertised on
+  `224.0.0.251:5353`
+- **SSDP / UPnP** — sends an M-SEARCH multicast and parses SSDP responses for
+  friendly names and model information
+- **MAC OUI lookup** — maps the first 24 bits of each MAC address to a vendor
+  name (IEEE registry, cached locally)
+- **Banner grabbing** — connects to common IoT ports and reads the first bytes
+  to identify device type
+- **ESPHome native API** — probes port 6053 for ESPHome firmware metadata
+  (device name, version, board, project)
+- **Home Assistant** — optionally queries the HA REST API (pass `--ha-token`)
+  to correlate devices with HA entity IDs
+
+### 4 — Risk scoring
 
 Each collected data point is evaluated against 14 security rules:
 
@@ -124,15 +143,63 @@ Each collected data point is evaluated against 14 security rules:
 **Risk label:** Critical ≥ 30 · High ≥ 15 · Medium ≥ 8 · Low > 0 · Info = 0  
 **Network score** = max(host scores) + mean(host scores)
 
-### 4 — Dashboard
+### 5 — SBOM collection
+
+After a successful SSH session, the tool collects a full Software Bill of
+Materials for the host by querying the package managers available on the
+remote system:
+
+| Tool / command | Package type | What is collected |
+|----------------|-------------|-------------------|
+| `dpkg-query -W` | `deb` | All installed Debian/Ubuntu packages — name, version, architecture |
+| `rpm -qa` | `rpm` | All installed RPM packages (RHEL, Fedora, openSUSE) — name, version-release, architecture |
+| `snap list` | `snap` | Installed Snap packages — name, version |
+| `flatpak list` | `flatpak` | Installed Flatpak apps — application ID, version, origin |
+| `pip3 list --format=freeze` | `python` | System Python packages (both system-wide and user `--user` installs) |
+| `docker images` | `container` | All container images present on the host — repository, tag |
+
+Only the tools present on the target host produce output; the rest return
+nothing and are silently skipped.
+
+#### Storage
+
+Each SBOM collection is stored as its own DuckDB database:
+
+```
+sbom/
+  <host-id>/           # MAC address preferred, IP fallback
+    20260412T143200.duckdb
+    20260411T091500.duckdb
+    ...
+  sbom_catalog.ducklake   # DuckLake catalog index
+  catalog_data/           # DuckLake Parquet data files
+```
+
+The **host ID** uses the MAC address when known so SBOM history follows the
+hardware, not the IP — useful when DHCP leases change.
+
+Under normal operation only the **latest** SBOM for each host is shown in the
+UI. All historical databases are kept on disk for manual comparison or
+archaeology — they are never deleted and never overwritten. A new SBOM is only
+collected if none exists for the host, or if the most recent one is more than
+24 hours old.
+
+The [DuckLake](https://ducklake.select/) extension provides a unified catalog
+view across all per-host databases. It is installed automatically by DuckDB on
+first run (`INSTALL ducklake`).
+
+### 6 — Dashboard
 
 The Textual TUI refreshes as data arrives:
 
 - **Left panel** — host list sorted by risk score, with coloured severity badges
 - **Right panel (tabbed)**
-  - *Host Details* — IP, MAC, OS, kernel, open ports
+  - *Host Details* — IP, MAC, OS, kernel, vendor, IoT identifiers, open ports
   - *Findings* — table of all findings sorted by severity
   - *Remediation* — copy-pasteable fix commands for each finding
+  - *SBOM* — package inventory for the selected host, showing source, name,
+    version, type, and architecture; header shows collection timestamp and
+    total package count
 - **Bottom** — scan progress bar and live log
 
 #### Keyboard shortcuts
@@ -147,28 +214,57 @@ The Textual TUI refreshes as data arrives:
 ## CLI options
 
 ```
-ohshit [--no-ssh] [--subnet CIDR] [--strict-host-keys]
+ohshit [--no-ssh] [--subnet CIDR] [--strict-host-keys] [--ha-token TOKEN] [--db PATH]
 
   --no-ssh            Discovery only — skip SSH login and data collection
   --subnet CIDR       Override auto-detected subnet, e.g. 192.168.1.0/24
   --strict-host-keys  Verify SSH host keys via ~/.ssh/known_hosts
+  --ha-token TOKEN    Home Assistant long-lived access token for IoT correlation
+  --db PATH           Path to the main DuckDB database (default: ohshit.db)
 ```
+
+## Data persistence
+
+All scan data is stored in a DuckDB database (`ohshit.db` by default) and
+persists across runs. Hosts are never deleted — offline hosts are marked
+**Unreachable** and remain in the list. Previously seen MAC addresses are
+tracked in a separate append-only history table to detect hardware repurposing.
+
+SBOM databases accumulate in the `sbom/` directory next to the main database
+and are never automatically removed.
 
 ## Project layout
 
 ```
 src/ohshit/
-  models.py          Dataclasses: Host, Finding, ScanResult, enums
+  models.py          Dataclasses: Host, Finding, PortInfo, IotInfo, ScanResult, enums
   discovery.py       ARP / ping sweep / nmap / router ARP
-  ssh_collector.py   asyncssh remote command collection
+  ssh_collector.py   asyncssh remote command collection + SBOM command definitions
   risk_engine.py     Scoring rules → Finding objects
+  sbom.py            SBOM collection, parsing, per-host DuckDB storage, DuckLake catalog
+  port_probe.py      Deep port banner / TLS / ESPHome probing
+  iot.py             mDNS sniff, UPnP/SSDP, Home Assistant, IoT device detection
+  oui_db.py          MAC OUI vendor lookup and MAC permanence classification
   report.py          Markdown report generator
   main.py            CLI entry point
   tui/
-    app.py           Textual App, workers, bindings
-    widgets.py       Custom widgets (host list, findings table, etc.)
+    app.py           Textual App, scanner pipeline, DB polling, SBOM wiring
+    widgets.py       Custom widgets: host list, findings table, SBOM tab, etc.
     app.tcss         Textual CSS layout and theming
 ```
+
+## Python dependencies
+
+| Library | Purpose |
+|---------|---------|
+| [Textual](https://textual.textualize.io/) | Terminal UI framework |
+| [asyncssh](https://asyncssh.readthedocs.io/) | Async SSH client for remote collection |
+| [DuckDB](https://duckdb.org/) | Embedded analytics database (hosts, findings, SBOM) |
+| [DuckLake](https://ducklake.select/) | Catalog layer unifying per-host SBOM databases (DuckDB extension, auto-installed) |
+| [aiohttp](https://docs.aiohttp.org/) | Async HTTP for Home Assistant and UPnP probing |
+| [aiofiles](https://github.com/Tinche/aiofiles) | Async file I/O for report export |
+| [cryptography](https://cryptography.io/) | TLS certificate inspection |
+| [rich](https://rich.readthedocs.io/) | Terminal formatting (used by Textual) |
 
 ## Development
 
@@ -181,7 +277,8 @@ make lint           # syntax check
 
 The TUI is built with [Textual](https://textual.textualize.io/). Network
 discovery and SSH collection are fully async (`asyncio` + `asyncssh`) and run
-as Textual worker tasks on the same event loop — no threads needed.
+in a background thread with its own event loop, writing to DuckDB via WAL
+which the UI thread reads without locking.
 
 ## Security notes
 
@@ -191,3 +288,5 @@ as Textual worker tasks on the same event loop — no threads needed.
   `--strict-host-keys` in higher-trust environments.
 - The exported Markdown report may contain sensitive system information
   (open ports, package versions, account names). Treat it accordingly.
+- SBOM databases stored in `sbom/` contain full package inventories for each
+  host. Restrict access to this directory appropriately.

@@ -22,6 +22,13 @@ RAW_COMMANDS: dict[str, str] = {
     "docker_ps":        "docker ps -a 2>/dev/null || true",
     "docker_images":    "docker images 2>/dev/null || true",
     "apt_upgradable":   "apt list --upgradable 2>/dev/null || true",
+    # SBOM collection commands
+    "sbom_dpkg":        "dpkg-query -W -f='${Package}\\t${Version}\\t${Architecture}\\n' 2>/dev/null || true",
+    "sbom_rpm":         "rpm -qa --queryformat '%{NAME}\\t%{VERSION}-%{RELEASE}\\t%{ARCH}\\n' 2>/dev/null || true",
+    "sbom_snap":        "snap list 2>/dev/null || true",
+    "sbom_flatpak":     "flatpak list --columns=application,version,origin 2>/dev/null || true",
+    "sbom_pip":         "pip3 list --format=freeze 2>/dev/null || pip list --format=freeze 2>/dev/null || true",
+    "sbom_pip_user":    "pip3 list --user --format=freeze 2>/dev/null || true",
 }
 
 

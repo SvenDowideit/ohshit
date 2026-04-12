@@ -459,3 +459,48 @@ class LogFeed(Widget):
 
     def write(self, line: str) -> None:
         self.query_one("#rich-log", RichLog).write(line)
+
+
+# ---------------------------------------------------------------------------
+# SbomTab
+# ---------------------------------------------------------------------------
+
+class SbomTab(Widget):
+    """Displays SBOM (Software Bill of Materials) for the selected host."""
+
+    def compose(self) -> ComposeResult:
+        yield Label("", id="sbom-header")
+        yield DataTable(id="sbom-table")
+
+    def on_mount(self) -> None:
+        tbl = self.query_one("#sbom-table", DataTable)
+        tbl.add_columns("Source", "Name", "Version", "Type", "Arch")
+        tbl.cursor_type = "row"
+
+    def update_sbom(self, packages: list[dict], host: "Host | None" = None) -> None:
+        """Refresh the SBOM display with the given package list."""
+        tbl = self.query_one("#sbom-table", DataTable)
+        tbl.clear(columns=False)
+
+        hdr = self.query_one("#sbom-header", Label)
+        if not packages:
+            if host is not None:
+                hdr.update(f"No SBOM collected yet for {host.display_name}")
+            else:
+                hdr.update("No SBOM data — select a host after a scan completes")
+            return
+
+        collected_at = packages[0].get("collected_at")
+        ts_str = _fmt_ts(collected_at) if collected_at else "unknown"
+        count = len(packages)
+        host_name = packages[0].get("hostname") or packages[0].get("ip", "")
+        hdr.update(f"{host_name}  —  {count} packages  (collected {ts_str})")
+
+        for pkg in sorted(packages, key=lambda p: (p.get("source", ""), p.get("name", ""))):
+            tbl.add_row(
+                pkg.get("source", ""),
+                pkg.get("name", ""),
+                pkg.get("version", ""),
+                pkg.get("package_type", ""),
+                pkg.get("arch", ""),
+            )
