@@ -29,7 +29,6 @@ from .oui_db import lookup_oui
 # Common IoT ports for banner grabbing
 # ---------------------------------------------------------------------------
 
-# Common IoT ports for banner grabbing
 _IOT_PORTS: list[tuple[int, str]] = [
     (80,   "http"),
     (443,  "https"),
@@ -45,22 +44,6 @@ _IOT_PORTS: list[tuple[int, str]] = [
     (1900, "upnp"),
     (5353, "mdns"),
 ]
-
-
-def lookup_oui(mac: str | None) -> tuple[str | None, str | None]:
-    """Return (vendor, device_type) from a MAC address OUI prefix."""
-    if not mac:
-        return None, None
-    prefix = mac.lower()[:8]  # "aa:bb:cc"
-    entry = _OUI.get(prefix)
-    if entry:
-        return entry
-    # Also try 6-char hex without colons
-    hex6 = mac.replace(":", "").replace("-", "").lower()[:6]
-    for key, val in _OUI.items():
-        if key.replace(":", "") == hex6:
-            return val
-    return None, None
 
 
 # ---------------------------------------------------------------------------

@@ -102,9 +102,14 @@ class HostListItem(ListItem):
     def refresh_host(self, host: Host) -> None:
         """Update badge, name, and state label in-place without re-mounting."""
         self.host = host
-        self.query_one(NetworkRiskBadge).update_severity(host.risk_label)
-        self.query_one(".host-name", Label).update(host.display_name)
-        self.query_one(".host-state", Label).update(host.state.value)
+        try:
+            self.query_one(NetworkRiskBadge).update_severity(host.risk_label)
+            self.query_one(".host-name", Label).update(host.display_name)
+            self.query_one(".host-state", Label).update(host.state.value)
+        except Exception:
+            # Children not yet mounted (item was just appended); compose() will
+            # use self.host when it runs, so nothing more needed here.
+            pass
 
 
 class HostListPanel(Widget):
