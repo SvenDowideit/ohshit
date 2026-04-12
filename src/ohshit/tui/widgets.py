@@ -234,6 +234,7 @@ class HostDetailTab(Widget):
         yield Label("", id="detail-iot")
         yield Label("", id="detail-repurpose")
         yield Label("", id="detail-esphome")
+        yield Label("", id="detail-vuln-summary")
         yield Label("Open Ports:", id="ports-label")
         yield DataTable(id="ports-table")
 
@@ -241,14 +242,19 @@ class HostDetailTab(Widget):
         tbl = self.query_one("#ports-table", DataTable)
         tbl.add_columns("Port", "Proto", "State", "Service", "Version")
 
-    def update_host(self, host: Host | None) -> None:
+    def update_host(
+        self,
+        host: "Host | None",
+        vuln_matches: "dict[str, list[dict]] | None" = None,
+        packages: "list[dict] | None" = None,
+    ) -> None:
         if host is None:
             self.query_one("#detail-header", Label).update(
                 "← Select a host from the list to see details"
             )
             for wid in ("detail-os", "detail-kernel", "detail-mac", "detail-ssh",
                         "detail-seen", "detail-vendor", "detail-iot", "detail-repurpose",
-                        "detail-esphome"):
+                        "detail-esphome", "detail-vuln-summary"):
                 self.query_one(f"#{wid}", Label).update("")
             self.query_one("#ports-table", DataTable).clear(columns=False)
             return
@@ -367,6 +373,63 @@ class HostDetailTab(Widget):
         else:
             self.query_one("#detail-esphome", Label).update("")
 
+        # Vulnerability summary
+        vuln_lbl = self.query_one("#detail-vuln-summary", Label)
+        if vuln_matches:
+            pkg_count = len(packages) if packages else "?"
+            total_cves = sum(len(v) for v in vuln_matches.values())
+            kev_count = sum(
+                1 for advs in vuln_matches.values()
+                for a in advs if a.get("source") == "kev"
+            )
+            ransomware_count = sum(
+                1 for advs in vuln_matches.values()
+                for a in advs if (a.get("ransomware") or "").lower() == "known"
+            )
+            # Count by severity (deduplicated across packages)
+            seen: set[str] = set()
+            sev_counts: dict[str, int] = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
+            for advs in vuln_matches.values():
+                for a in advs:
+                    aid = a.get("id", "")
+                    if aid in seen:
+                        continue
+                    seen.add(aid)
+                    sev = (a.get("severity") or "").capitalize()
+                    if sev in sev_counts:
+                        sev_counts[sev] += 1
+
+            line = Text()
+            line.append("CVEs: ")
+            line.append(f"{total_cves} total", style="bold")
+            line.append("  across ")
+            line.append(f"{len(vuln_matches)}", style="bold")
+            line.append(f" of {pkg_count} packages  |  ")
+            # Severity breakdown
+            for sev, style in (
+                ("Critical", "bold white on red"),
+                ("High",     "bold black on yellow"),
+                ("Medium",   "black on dark_orange3"),
+                ("Low",      "black on green"),
+            ):
+                n = sev_counts[sev]
+                if n:
+                    line.append(f" {sev[:4]}:{n} ", style=style)
+                    line.append(" ")
+            if kev_count:
+                line.append(f"  ★ {kev_count} KEV", style="bold red")
+            if ransomware_count:
+                line.append(f"  R {ransomware_count} ransomware", style="bold red")
+            vuln_lbl.update(line)
+        elif packages:
+            vuln_lbl.update(
+                Text(f"CVEs: not yet queried — press ", style="dim") +
+                Text("v", style="bold") +
+                Text(" to query OSV", style="dim")
+            )
+        else:
+            vuln_lbl.update("")
+
         tbl = self.query_one("#ports-table", DataTable)
         tbl.clear(columns=False)
         for p in sorted(host.open_ports, key=lambda x: x.port):
@@ -477,7 +540,7 @@ class SbomTab(Widget):
 
     def on_mount(self) -> None:
         tbl = self.query_one("#sbom-table", DataTable)
-        tbl.add_columns("CVEs", "Released", "Source", "Name", "Version", "Arch")
+        tbl.add_columns("Risk", "CVEs", "Released", "Source", "Name", "Version", "Arch")
         tbl.cursor_type = "row"
 
     def update_sbom(
@@ -512,6 +575,12 @@ class SbomTab(Widget):
         hdr.update(f"{host_name}  —  {count} packages  (collected {ts_str}){vuln_str}")
 
         _SEVER_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4, "": 4}
+        _SEVER_STYLE = {
+            "critical": ("CRIT", "bold white on red"),
+            "high":     ("HIGH", "bold black on yellow"),
+            "medium":   ("MED",  "black on dark_orange3"),
+            "low":      ("LOW",  "black on green"),
+        }
 
         def _sort_key(p: dict):
             key = f"{p.get('source', '')}:{p.get('name', '')}:{p.get('version', '')}"
@@ -534,13 +603,11 @@ class SbomTab(Widget):
             else:
                 released_ts = ra if ra.tzinfo else ra.replace(tzinfo=timezone.utc)
 
-            # Sort: KEV hits first, then worst severity, then CVE count desc,
-            # then released_at desc (newest first among equal-vuln packages)
             return (
-                0 if kev_hit else 1,       # KEV first
-                worst,                      # lower = more severe = sort first
-                -cve_count,                 # more CVEs = sort first
-                -released_ts.timestamp(),   # newer = lower negative = sort first
+                0 if kev_hit else 1,
+                worst,
+                -cve_count,
+                -released_ts.timestamp(),
             )
 
         for pkg in sorted(packages, key=_sort_key):
@@ -554,12 +621,30 @@ class SbomTab(Widget):
 
             key = f"{pkg.get('source', '')}:{pkg.get('name', '')}:{pkg.get('version', '')}"
             advisories = (vuln_matches or {}).get(key, [])
-            if advisories:
-                cve_text = Text(str(len(advisories)), style="bold red")
+
+            # Compute worst severity and KEV status for this package
+            worst_sev = ""
+            kev_hit = False
+            for adv in advisories:
+                sev = (adv.get("severity") or "").lower()
+                if _SEVER_RANK.get(sev, 4) < _SEVER_RANK.get(worst_sev, 4):
+                    worst_sev = sev
+                if adv.get("source") == "kev":
+                    kev_hit = True
+
+            # Risk badge
+            if kev_hit:
+                risk_text = Text(" ★KEV ", style="bold white on red")
+            elif worst_sev in _SEVER_STYLE:
+                label, style = _SEVER_STYLE[worst_sev]
+                risk_text = Text(f" {label} ", style=style)
             else:
-                cve_text = Text("")
+                risk_text = Text("")
+
+            cve_text = Text(str(len(advisories)), style="bold red") if advisories else Text("")
 
             tbl.add_row(
+                risk_text,
                 cve_text,
                 age_str,
                 pkg.get("source", ""),

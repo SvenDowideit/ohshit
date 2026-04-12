@@ -386,7 +386,9 @@ class OhShitApp(App[None]):
             await self._refresh_right_panel(self._hosts[self.selected_ip])
 
     async def _refresh_right_panel(self, host: Host) -> None:
-        self.query_one("#host-detail", HostDetailTab).update_host(host)
+        packages = self._sbom_packages.get(host.ip, [])
+        vuln_matches = self._vuln_matches.get(host.ip, {})
+        self.query_one("#host-detail", HostDetailTab).update_host(host, vuln_matches=vuln_matches, packages=packages)
         self.query_one("#findings-table", FindingsTable).update_host(host)
         await self.query_one("#remediation-panel", RemediationPanel).update_host(host)
         # SBOM tab — load from cached packages dict
