@@ -23,8 +23,8 @@ RAW_COMMANDS: dict[str, str] = {
     "docker_images":    "docker images 2>/dev/null || true",
     "apt_upgradable":   "apt list --upgradable 2>/dev/null || true",
     # SBOM collection commands
-    "sbom_dpkg":        "dpkg-query -W -f='${Package}\\t${Version}\\t${Architecture}\\n' 2>/dev/null || true",
-    "sbom_rpm":         "rpm -qa --queryformat '%{NAME}\\t%{VERSION}-%{RELEASE}\\t%{ARCH}\\n' 2>/dev/null || true",
+    "sbom_dpkg":        "dpkg-query -W -f=$'${Package}\\t${Version}\\t${Architecture}\\n' 2>/dev/null || true",
+    "sbom_rpm":         "rpm -qa --queryformat $'%{NAME}\\t%{VERSION}-%{RELEASE}\\t%{ARCH}\\n' 2>/dev/null || true",
     "sbom_snap":        "snap list 2>/dev/null || true",
     "sbom_flatpak":     "flatpak list --columns=application,version,origin 2>/dev/null || true",
     "sbom_pip":         "pip3 list --format=freeze 2>/dev/null || pip list --format=freeze 2>/dev/null || true",
@@ -87,7 +87,15 @@ class RemoteCollector:
             except Exception:
                 return ""
 
-        outputs = await asyncio.gather(*[run_one(c) for c in cmds])
+        # Run in batches of 8 to stay under the SSH server's per-connection
+        # channel limit (typically 10).  All commands within a batch run
+        # concurrently; batches run sequentially.
+        BATCH = 8
+        outputs: list[str] = []
+        for i in range(0, len(cmds), BATCH):
+            batch_results = await asyncio.gather(*[run_one(c) for c in cmds[i:i + BATCH]])
+            outputs.extend(batch_results)
+
         return dict(zip(keys, outputs))
 
     async def _check_shadow(self, conn: Any, raw: dict[str, Any]) -> None:

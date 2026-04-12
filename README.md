@@ -208,6 +208,7 @@ The Textual TUI refreshes as data arrives:
 |-----|--------|
 | `r` | Re-scan all hosts |
 | `s` | Re-scan the selected host |
+| `b` | Force SBOM collection for the selected host (bypasses the 24 h age check) |
 | `e` | Export Markdown report to `~/network-security-report-<timestamp>.md` |
 | `q` | Quit |
 

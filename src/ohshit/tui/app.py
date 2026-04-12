@@ -79,6 +79,7 @@ class OhShitApp(App[None]):
     BINDINGS = [
         Binding("r", "rescan_all", "Re-scan All", show=True),
         Binding("s", "rescan_selected", "Re-scan Host", show=True),
+        Binding("b", "collect_sbom", "Collect SBOM", show=True),
         Binding("e", "export_report", "Export Report", show=True),
         Binding("q", "quit", "Quit", show=True),
     ]
@@ -267,6 +268,16 @@ class OhShitApp(App[None]):
             return
         self._launch_scanner_thread(single_ip=self.selected_ip)
 
+    def action_collect_sbom(self) -> None:
+        """Force SBOM collection for the selected host, bypassing the age check."""
+        if not self.selected_ip:
+            self._log("[yellow]No host selected.[/yellow]")
+            return
+        if self.scan_running:
+            self._log("[yellow]Scan already running.[/yellow]")
+            return
+        self._launch_scanner_thread(single_ip=self.selected_ip, force_sbom=True)
+
     async def action_export_report(self) -> None:
         if not self._hosts:
             self.notify("No scan data to export yet.", severity="warning")
@@ -284,7 +295,7 @@ class OhShitApp(App[None]):
     # Scanner thread launcher
     # ------------------------------------------------------------------
 
-    def _launch_scanner_thread(self, single_ip: str | None = None) -> None:
+    def _launch_scanner_thread(self, single_ip: str | None = None, force_sbom: bool = False) -> None:
         """Start the scanner in a background thread with its own asyncio loop."""
         self.scan_running = True
         self._set_progress("Starting scanner…", 0)
@@ -300,6 +311,7 @@ class OhShitApp(App[None]):
                         subnet_override=self._subnet_override,
                         ha_token=self._ha_token,
                         single_ip=single_ip,
+                        force_sbom=force_sbom,
                         progress_cb=self._thread_safe_progress,
                         log_cb=self._thread_safe_log,
                     )
@@ -370,6 +382,7 @@ async def _scanner_async(
     subnet_override: str | None,
     ha_token: str | None,
     single_ip: str | None,
+    force_sbom: bool,
     progress_cb: Any,
     log_cb: Any,
 ) -> None:
@@ -475,9 +488,9 @@ async def _scanner_async(
             if raw:
                 _apply_os_release(host, raw)
                 host.last_scan = datetime.now()
-                # Collect SBOM from SSH data (only if needed)
+                # Collect SBOM from SSH data (only if needed, or forced)
                 host_id = host.mac or host.ip
-                if should_collect_sbom(sbom_base, host_id):
+                if force_sbom or should_collect_sbom(sbom_base, host_id):
                     packages = collect_packages_from_raw(raw)
                     if packages:
                         collected_at = datetime.now()
@@ -495,6 +508,15 @@ async def _scanner_async(
                             f"[dim]SBOM:[/dim] {host.display_name} — "
                             f"{len(packages)} packages → {sbom_path.name}"
                         )
+                    else:
+                        log_cb(
+                            f"[dim]SBOM:[/dim] {host.display_name} — "
+                            f"no packages found (dpkg/rpm/pip/snap/flatpak/docker all empty)"
+                        )
+                else:
+                    log_cb(
+                        f"[dim]SBOM:[/dim] {host.display_name} — skipped (collected recently, press [bold]b[/bold] to force)"
+                    )
 
         # For hosts where SSH didn't run or failed, do a TCP connect scan
         # to populate open_ports (nmap may have already done this during
