@@ -117,6 +117,15 @@ _SCHEMA_STATEMENTS = [
     hosts_found INTEGER,
     status      TEXT NOT NULL DEFAULT 'running'
 )""",
+    """CREATE TABLE IF NOT EXISTS sbom_index (
+    host_id       TEXT NOT NULL,
+    ip            TEXT NOT NULL,
+    hostname      TEXT NOT NULL DEFAULT '',
+    collected_at  TIMESTAMPTZ NOT NULL,
+    db_path       TEXT NOT NULL,
+    package_count INTEGER NOT NULL DEFAULT 0,
+    is_latest     BOOLEAN NOT NULL DEFAULT TRUE
+)""",
 ]
 
 # Migrations: ALTER TABLE statements to add columns to existing DB files.

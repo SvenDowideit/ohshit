@@ -6,10 +6,13 @@ Design
     sbom/<host_id>/<timestamp>.duckdb
   where host_id is the MAC address (preferred) or IP (fallback).
 
-- A DuckLake catalog (sbom_catalog.ducklake) provides a unified view
-  across all per-host SBOM databases. Under normal operation only the
-  latest SBOM for each host is surfaced. Historical databases are kept
-  for comparison/archaeology but never re-collected unless forced.
+- An sbom_index table in the main ohshit.db tracks all per-host SBOM
+  databases (path, timestamp, package count, is_latest flag).  This
+  piggybacks on the existing DuckDB WAL concurrency so the scanner
+  thread and UI thread can both access it without conflicts.
+
+- DuckLake is used on demand to query across multiple per-host files
+  (e.g. for historical comparison), but is NOT held open persistently.
 
 - SBOM collection sources:
     dpkg/apt  — Debian/Ubuntu systems
@@ -288,46 +291,28 @@ def collect_packages_from_raw(raw: dict[str, Any]) -> list[SbomPackage]:
 
 
 # ---------------------------------------------------------------------------
-# DuckLake catalog — unified read-only view
+# sbom_index table — lives in the main ohshit.db, managed via the existing
+# writer/reader connections so WAL concurrency is handled automatically.
 # ---------------------------------------------------------------------------
 
-_CATALOG_SCHEMA = [
-    """CREATE TABLE IF NOT EXISTS sbom_index (
-        host_id      TEXT NOT NULL,
-        ip           TEXT NOT NULL,
-        hostname     TEXT NOT NULL DEFAULT '',
-        collected_at TIMESTAMPTZ NOT NULL,
-        db_path      TEXT NOT NULL,
-        package_count INTEGER NOT NULL DEFAULT 0,
-        is_latest    BOOLEAN NOT NULL DEFAULT TRUE
-    )""",
-]
+_INDEX_SCHEMA = """CREATE TABLE IF NOT EXISTS sbom_index (
+    host_id       TEXT NOT NULL,
+    ip            TEXT NOT NULL,
+    hostname      TEXT NOT NULL DEFAULT '',
+    collected_at  TIMESTAMPTZ NOT NULL,
+    db_path       TEXT NOT NULL,
+    package_count INTEGER NOT NULL DEFAULT 0,
+    is_latest     BOOLEAN NOT NULL DEFAULT TRUE
+)"""
 
 
-def _ensure_catalog_schema(con: duckdb.DuckDBPyConnection) -> None:
-    for stmt in _CATALOG_SCHEMA:
-        con.execute(stmt)
-
-
-def open_catalog(base_dir: Path) -> duckdb.DuckDBPyConnection:
-    """Open the DuckLake catalog, installing and loading the extension."""
-    catalog_path = _sbom_dir(base_dir) / "sbom_catalog.ducklake"
-    data_dir = _sbom_dir(base_dir) / "catalog_data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-
-    con = duckdb.connect(":memory:")
-    con.execute("INSTALL ducklake")
-    con.execute("LOAD ducklake")
-    con.execute(
-        f"ATTACH 'ducklake:{catalog_path}' AS sbom_lake (DATA_PATH '{data_dir}')"
-    )
-    con.execute("USE sbom_lake")
-    _ensure_catalog_schema(con)
-    return con
+def ensure_sbom_schema(con: duckdb.DuckDBPyConnection) -> None:
+    """Add sbom_index to an existing ohshit.db connection if not present."""
+    con.execute(_INDEX_SCHEMA)
 
 
 def register_sbom_in_catalog(
-    catalog_con: duckdb.DuckDBPyConnection,
+    con: duckdb.DuckDBPyConnection,
     host_id: str,
     ip: str,
     hostname: str | None,
@@ -335,51 +320,37 @@ def register_sbom_in_catalog(
     db_path: Path,
     package_count: int,
 ) -> None:
-    """Record a new SBOM database in the catalog and mark previous as not latest."""
-    # Mark all prior entries for this host as not latest
-    catalog_con.execute(
+    """Record a new SBOM database in sbom_index and mark previous as not latest."""
+    con.execute(
         "UPDATE sbom_index SET is_latest = FALSE WHERE host_id = ?",
         [host_id],
     )
-    # Check if this exact entry already exists (idempotent)
-    existing = catalog_con.execute(
-        "SELECT COUNT(*) FROM sbom_index WHERE host_id = ? AND collected_at = ?",
-        [host_id, collected_at],
-    ).fetchone()
-    if existing and existing[0] > 0:
-        catalog_con.execute(
-            "UPDATE sbom_index SET is_latest = TRUE, ip = ?, hostname = ?, db_path = ?, package_count = ? "
-            "WHERE host_id = ? AND collected_at = ?",
-            [ip, hostname or "", str(db_path), package_count, host_id, collected_at],
-        )
-    else:
-        catalog_con.execute(
-            """INSERT INTO sbom_index
-                   (host_id, ip, hostname, collected_at, db_path, package_count, is_latest)
-               VALUES (?, ?, ?, ?, ?, ?, TRUE)""",
-            [host_id, ip, hostname or "", collected_at, str(db_path), package_count],
-        )
+    con.execute(
+        """INSERT INTO sbom_index
+               (host_id, ip, hostname, collected_at, db_path, package_count, is_latest)
+           VALUES (?, ?, ?, ?, ?, ?, TRUE)""",
+        [host_id, ip, hostname or "", collected_at, str(db_path), package_count],
+    )
 
 
 def load_latest_packages(
-    catalog_con: duckdb.DuckDBPyConnection,
+    con: duckdb.DuckDBPyConnection,
     ip: str | None = None,
 ) -> list[dict]:
     """Load packages from the latest SBOM for each host (or a specific host)."""
-    # Get the latest db_path for each host
     where = "WHERE is_latest = TRUE"
     params: list = []
     if ip:
         where += " AND ip = ?"
         params.append(ip)
 
-    index_rows = catalog_con.execute(
-        f"SELECT host_id, ip, hostname, collected_at, db_path, package_count FROM sbom_index {where}",
+    index_rows = con.execute(
+        f"SELECT host_id, ip, hostname, collected_at, db_path FROM sbom_index {where}",
         params,
     ).fetchall()
 
     results = []
-    for host_id, row_ip, hostname, collected_at, db_path, pkg_count in index_rows:
+    for host_id, row_ip, hostname, collected_at, db_path in index_rows:
         db = Path(db_path)
         if not db.exists():
             continue
@@ -406,11 +377,9 @@ def load_latest_packages(
     return results
 
 
-def load_sbom_summary(
-    catalog_con: duckdb.DuckDBPyConnection,
-) -> list[dict]:
+def load_sbom_summary(con: duckdb.DuckDBPyConnection) -> list[dict]:
     """Return per-host SBOM summary (latest only)."""
-    rows = catalog_con.execute(
+    rows = con.execute(
         """SELECT host_id, ip, hostname, collected_at, package_count
            FROM sbom_index
            WHERE is_latest = TRUE
@@ -426,3 +395,32 @@ def load_sbom_summary(
         }
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# DuckLake — on-demand cross-host queries (archaeology / comparison only)
+# ---------------------------------------------------------------------------
+
+def ducklake_query(base_dir: Path, sql: str) -> list[tuple]:
+    """Open a short-lived DuckLake connection, run sql, return rows, close.
+
+    Use this for historical / cross-host queries only — do not hold the
+    connection open, as DuckLake only supports one concurrent connection.
+    """
+    catalog_path = _sbom_dir(base_dir) / "sbom_catalog.ducklake"
+    data_dir = _sbom_dir(base_dir) / "catalog_data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    con = duckdb.connect(":memory:")
+    con.execute("INSTALL ducklake")
+    con.execute("LOAD ducklake")
+    con.execute(
+        f"ATTACH 'ducklake:{catalog_path}' AS sbom_lake (DATA_PATH '{data_dir}')"
+    )
+    con.execute("USE sbom_lake")
+    try:
+        rows = con.execute(sql).fetchall()
+    finally:
+        con.close()
+    return rows
+

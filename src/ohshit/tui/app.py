@@ -52,7 +52,6 @@ from ..risk_engine import RiskEngine
 from ..sbom import (
     collect_packages_from_raw,
     load_latest_packages,
-    open_catalog,
     register_sbom_in_catalog,
     should_collect_sbom,
     write_sbom,
@@ -107,8 +106,6 @@ class OhShitApp(App[None]):
         self._reader: Any = None
         # Cache of last-loaded hosts so selection survives refreshes
         self._hosts: dict[str, Host] = {}
-        # DuckLake SBOM catalog connection (UI thread)
-        self._sbom_catalog: Any = None
         # Cache: ip -> list[dict] packages for the SBOM tab
         self._sbom_packages: dict[str, list[dict]] = {}
 
@@ -145,13 +142,6 @@ class OhShitApp(App[None]):
         threading.Thread(target=self._refresh_oui_cache, daemon=True, name="oui-cache").start()
         # Open reader connection
         self._reader = DB.open_reader(self._db_path)
-        # Open SBOM catalog
-        try:
-            self._sbom_catalog = open_catalog(self._db_path.parent)
-        except Exception as exc:
-            self._sbom_catalog = None
-            # Log after mount completes
-            self.call_after_refresh(lambda: self._log(f"[yellow]SBOM catalog unavailable: {exc}[/yellow]"))
         # Load whatever is already in the DB immediately
         self._poll_db()
         self._log(f"Database: [bold]{self._db_path}[/bold]")
@@ -170,11 +160,6 @@ class OhShitApp(App[None]):
         if self._reader:
             try:
                 self._reader.close()
-            except Exception:
-                pass
-        if self._sbom_catalog:
-            try:
-                self._sbom_catalog.close()
             except Exception:
                 pass
 
@@ -201,26 +186,21 @@ class OhShitApp(App[None]):
             self._hosts = DB.load_all_hosts(self._reader)
             summary = DB.load_scan_summary(self._reader)
             self._update_subtitle(summary)
-            # Refresh SBOM packages from catalog
+            # Refresh SBOM packages from sbom_index in the same DB
             self._refresh_sbom_cache()
             self.call_after_refresh(self._refresh_panels_sync)
         except Exception as exc:
             self._log(f"[dim red]DB poll error: {exc}[/dim red]")
 
     def _refresh_sbom_cache(self) -> None:
-        """Load latest SBOM packages from the DuckLake catalog into the cache."""
-        if not self._sbom_catalog:
+        """Load latest SBOM packages from sbom_index into the display cache."""
+        if not self._reader:
             return
         try:
-            # Re-open catalog each poll so it sees new SBOM databases
-            self._sbom_catalog.close()
-            self._sbom_catalog = open_catalog(self._db_path.parent)
-            all_packages = load_latest_packages(self._sbom_catalog)
-            # Index by IP
+            all_packages = load_latest_packages(self._reader)
             by_ip: dict[str, list[dict]] = {}
             for pkg in all_packages:
-                ip = pkg["ip"]
-                by_ip.setdefault(ip, []).append(pkg)
+                by_ip.setdefault(pkg["ip"], []).append(pkg)
             self._sbom_packages = by_ip
         except Exception:
             pass
@@ -398,13 +378,6 @@ async def _scanner_async(
     risk_engine = RiskEngine()
     sbom_base = db_path.parent
 
-    # Open SBOM catalog in scanner thread (separate connection from UI thread)
-    try:
-        sbom_catalog = open_catalog(sbom_base)
-    except Exception as exc:
-        sbom_catalog = None
-        log_cb(f"[yellow]SBOM catalog unavailable: {exc}[/yellow]")
-
     def prog(step: str, pct: int) -> None:
         progress_cb(step, pct)
 
@@ -504,7 +477,7 @@ async def _scanner_async(
                 host.last_scan = datetime.now()
                 # Collect SBOM from SSH data (only if needed)
                 host_id = host.mac or host.ip
-                if sbom_catalog and should_collect_sbom(sbom_base, host_id):
+                if should_collect_sbom(sbom_base, host_id):
                     packages = collect_packages_from_raw(raw)
                     if packages:
                         collected_at = datetime.now()
@@ -515,7 +488,7 @@ async def _scanner_async(
                             collected_at=collected_at,
                         )
                         register_sbom_in_catalog(
-                            sbom_catalog, host_id, host.ip,
+                            writer, host_id, host.ip,
                             host.hostname, collected_at, sbom_path, len(packages),
                         )
                         log_cb(
@@ -555,11 +528,6 @@ async def _scanner_async(
 
     DB.finish_scan_log(writer, scan_id, len(result.hosts))
     writer.close()
-    if sbom_catalog:
-        try:
-            sbom_catalog.close()
-        except Exception:
-            pass
 
     log_cb(
         f"[bold]Scan complete.[/bold] {total} hosts  |  "
