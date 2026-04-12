@@ -105,7 +105,8 @@ _SCHEMA_STATEMENTS = [
     ha_entity_id        TEXT,
     mqtt_topics_json    TEXT NOT NULL DEFAULT '[]',
     banner_grabs_json   TEXT NOT NULL DEFAULT '{}',
-    detection_methods_json TEXT NOT NULL DEFAULT '[]'
+    detection_methods_json TEXT NOT NULL DEFAULT '[]',
+    esphome_info_json   TEXT NOT NULL DEFAULT '{}'
 )""",
     """CREATE TABLE IF NOT EXISTS scan_log (
     id          TEXT PRIMARY KEY,
@@ -121,7 +122,8 @@ _SCHEMA_STATEMENTS = [
 # Migrations: ALTER TABLE statements to add columns to existing DB files.
 # Each tuple is (table, column, sql_type_and_default).
 _MIGRATIONS = [
-    ("iot_info", "mac_permanence", "TEXT"),
+    ("iot_info", "mac_permanence",    "TEXT"),
+    ("iot_info", "esphome_info_json", "TEXT"),
 ]
 
 
@@ -247,8 +249,9 @@ def upsert_iot(con: duckdb.DuckDBPyConnection, ip: str, iot: IotInfo) -> None:
             (ip, vendor, device_type, mac_permanence,
              mdns_names_json, mdns_services_json,
              upnp_friendly_name, upnp_model, ha_entity_id,
-             mqtt_topics_json, banner_grabs_json, detection_methods_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             mqtt_topics_json, banner_grabs_json, detection_methods_json,
+             esphome_info_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (ip) DO UPDATE SET
             vendor              = COALESCE(excluded.vendor, iot_info.vendor),
             device_type         = COALESCE(excluded.device_type, iot_info.device_type),
@@ -260,7 +263,10 @@ def upsert_iot(con: duckdb.DuckDBPyConnection, ip: str, iot: IotInfo) -> None:
             ha_entity_id        = COALESCE(excluded.ha_entity_id, iot_info.ha_entity_id),
             mqtt_topics_json    = excluded.mqtt_topics_json,
             banner_grabs_json   = excluded.banner_grabs_json,
-            detection_methods_json = excluded.detection_methods_json
+            detection_methods_json = excluded.detection_methods_json,
+            esphome_info_json   = CASE WHEN excluded.esphome_info_json != '{}'
+                                       THEN excluded.esphome_info_json
+                                       ELSE iot_info.esphome_info_json END
     """, [
         ip,
         iot.vendor, iot.device_type, iot.mac_permanence,
@@ -269,6 +275,7 @@ def upsert_iot(con: duckdb.DuckDBPyConnection, ip: str, iot: IotInfo) -> None:
         json.dumps(iot.mqtt_topics),
         json.dumps(iot.banner_grabs),
         json.dumps(iot.detection_methods),
+        json.dumps(iot.esphome_info),
     ])
 
 
@@ -277,8 +284,17 @@ def write_host_complete(con: duckdb.DuckDBPyConnection, host: Host) -> None:
     upsert_host(con, host)
     replace_ports(con, host)
     replace_findings(con, host)
-    if host.iot_info.detection_methods:
-        upsert_iot(con, host.ip, host.iot_info)
+    iot = host.iot_info
+    has_iot_data = bool(
+        iot.detection_methods
+        or iot.vendor
+        or iot.device_type
+        or iot.mdns_names
+        or iot.upnp_friendly_name
+        or iot.esphome_info
+    )
+    if has_iot_data:
+        upsert_iot(con, host.ip, iot)
     data_changed.set()
 
 
@@ -371,12 +387,14 @@ def load_all_hosts(con: duckdb.DuckDBPyConnection) -> dict[str, Host]:
         SELECT ip, vendor, device_type, mac_permanence,
                mdns_names_json, mdns_services_json,
                upnp_friendly_name, upnp_model, ha_entity_id,
-               mqtt_topics_json, banner_grabs_json, detection_methods_json
+               mqtt_topics_json, banner_grabs_json, detection_methods_json,
+               esphome_info_json
         FROM iot_info
     """).fetchall()
     for (ip, vendor, device_type, mac_permanence, mdns_names_json, mdns_services_json,
          upnp_friendly_name, upnp_model, ha_entity_id,
-         mqtt_topics_json, banner_grabs_json, detection_methods_json) in iot_rows:
+         mqtt_topics_json, banner_grabs_json, detection_methods_json,
+         esphome_info_json) in iot_rows:
         if ip in hosts:
             hosts[ip].iot_info = IotInfo(
                 vendor=vendor,
@@ -390,6 +408,7 @@ def load_all_hosts(con: duckdb.DuckDBPyConnection) -> dict[str, Host]:
                 mqtt_topics=json.loads(mqtt_topics_json or "[]"),
                 banner_grabs={int(k): v for k, v in json.loads(banner_grabs_json or "{}").items()},
                 detection_methods=json.loads(detection_methods_json or "[]"),
+                esphome_info=json.loads(esphome_info_json or "{}"),
             )
 
     # Bulk load MAC history

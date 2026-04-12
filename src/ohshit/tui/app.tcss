@@ -119,7 +119,7 @@ HostListItem > Horizontal {
     margin-bottom: 1;
 }
 
-#detail-os, #detail-kernel, #detail-mac, #detail-ssh, #detail-seen {
+#detail-os, #detail-kernel, #detail-mac, #detail-ssh, #detail-seen, #detail-vendor, #detail-iot, #detail-esphome {
     padding: 0 1;
 }
 

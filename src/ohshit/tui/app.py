@@ -503,3 +503,7 @@ def _merge_iot(base: IotInfo, new: IotInfo) -> None:
     for m in new.detection_methods:
         if m not in base.detection_methods:
             base.detection_methods.append(m)
+    # Merge ESPHome info — new values win over empty/missing
+    for k, v in new.esphome_info.items():
+        if v and not base.esphome_info.get(k):
+            base.esphome_info[k] = v

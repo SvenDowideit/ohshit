@@ -88,8 +88,8 @@ class _MDNSProtocol(asyncio.DatagramProtocol):
         ip = addr[0]
         if ip.startswith("169.254") or ip == "127.0.0.1":
             return
-        names, services = _parse_mdns_minimal(data)
-        if not names and not services:
+        names, services, esphome = _parse_mdns_full(data)
+        if not names and not services and not esphome:
             return
         if ip not in self._results:
             self._results[ip] = IotInfo(detection_methods=["mDNS"])
@@ -100,38 +100,146 @@ class _MDNSProtocol(asyncio.DatagramProtocol):
         for s in services:
             if s not in info.mdns_services:
                 info.mdns_services.append(s)
+        if esphome:
+            info.esphome_info.update(esphome)
+            if "friendly_name" in esphome and esphome["friendly_name"] not in info.mdns_names:
+                info.mdns_names.insert(0, esphome["friendly_name"])
+            if "version" in esphome:
+                info.device_type = info.device_type or "ESPHome Device"
+            if "esphome-mdns" not in info.detection_methods:
+                info.detection_methods.append("esphome-mdns")
 
 
-def _parse_mdns_minimal(data: bytes) -> tuple[list[str], list[str]]:
-    """Very minimal DNS packet parser — extract PTR/SRV name strings."""
+def _dns_read_name(data: bytes, offset: int) -> tuple[str, int]:
+    """Read a DNS name from data at offset, following pointers. Returns (name, new_offset)."""
+    labels: list[str] = []
+    visited: set[int] = set()
+    original_end = offset
+    jumped = False
+    while offset < len(data):
+        if offset in visited:
+            break
+        visited.add(offset)
+        length = data[offset]
+        if length == 0:
+            if not jumped:
+                original_end = offset + 1
+            break
+        if length & 0xC0 == 0xC0:
+            if offset + 1 >= len(data):
+                break
+            ptr = ((length & 0x3F) << 8) | data[offset + 1]
+            if not jumped:
+                original_end = offset + 2
+            jumped = True
+            offset = ptr
+            continue
+        offset += 1
+        if offset + length > len(data):
+            break
+        labels.append(data[offset:offset + length].decode("utf-8", errors="replace"))
+        offset += length
+    return ".".join(labels), original_end
+
+
+def _parse_mdns_full(data: bytes) -> tuple[list[str], list[str], dict[str, str]]:
+    """Parse a DNS/mDNS packet and extract names, service types, and ESPHome TXT data."""
     names: list[str] = []
     services: list[str] = []
+    esphome: dict[str, str] = {}
     try:
-        # Skip 12-byte header, try to extract readable labels
+        if len(data) < 12:
+            return names, services, esphome
+        qdcount = (data[4] << 8) | data[5]
+        ancount = (data[6] << 8) | data[7]
+        nscount = (data[8] << 8) | data[9]
+        arcount = (data[10] << 8) | data[11]
         offset = 12
-        while offset < len(data) - 4:
-            length = data[offset]
-            if length == 0:
-                offset += 1
-                continue
-            if length & 0xC0 == 0xC0:  # pointer
-                offset += 2
-                continue
-            if offset + length + 1 > len(data):
+
+        # Skip questions
+        for _ in range(qdcount):
+            _, offset = _dns_read_name(data, offset)
+            offset += 4  # qtype + qclass
+
+        # Parse answer, authority, and additional records
+        for _ in range(ancount + nscount + arcount):
+            if offset >= len(data):
                 break
-            label = data[offset + 1: offset + 1 + length]
-            try:
-                text = label.decode("utf-8", errors="ignore")
-                if "._tcp" in text or "._udp" in text:
-                    services.append(text)
-                elif ".local" in text or len(text) > 2:
-                    names.append(text)
-            except Exception:
-                pass
-            offset += length + 1
+            rname, offset = _dns_read_name(data, offset)
+            if offset + 10 > len(data):
+                break
+            rtype = (data[offset] << 8) | data[offset + 1]
+            # rclass = (data[offset + 2] << 8) | data[offset + 3]
+            # ttl = 4 bytes
+            rdlength = (data[offset + 8] << 8) | data[offset + 9]
+            offset += 10
+            rdata_start = offset
+            if offset + rdlength > len(data):
+                break
+
+            rname_lower = rname.lower()
+
+            if rtype == 12:  # PTR
+                ptr_name, _ = _dns_read_name(data, offset)
+                ptr_lower = ptr_name.lower()
+                if "._tcp" in rname_lower or "._udp" in rname_lower:
+                    svc = rname_lower.replace(".local", "")
+                    if svc not in services:
+                        services.append(svc)
+                if ".local" in ptr_lower and "._" not in ptr_lower:
+                    label = ptr_name.split(".")[0]
+                    if label and label not in names:
+                        names.append(label)
+
+            elif rtype == 1:  # A record — skip but note the name
+                if ".local" in rname_lower and "._" not in rname_lower:
+                    label = rname.split(".")[0]
+                    if label and label not in names:
+                        names.append(label)
+
+            elif rtype == 33:  # SRV
+                # target is at offset+6
+                target, _ = _dns_read_name(data, offset + 6)
+                if ".local" in target.lower():
+                    label = target.split(".")[0]
+                    if label and label not in names:
+                        names.append(label)
+
+            elif rtype == 16:  # TXT
+                # Only parse TXT for esphomelib services
+                is_esphome = "_esphomelib._tcp" in rname_lower
+                txt_offset = offset
+                while txt_offset < rdata_start + rdlength:
+                    tlen = data[txt_offset]
+                    txt_offset += 1
+                    if txt_offset + tlen > rdata_start + rdlength:
+                        break
+                    kv = data[txt_offset:txt_offset + tlen].decode("utf-8", errors="replace")
+                    txt_offset += tlen
+                    if is_esphome and "=" in kv:
+                        k, _, v = kv.partition("=")
+                        k = k.strip().lower()
+                        # Map ESPHome TXT keys to our esphome_info dict keys
+                        key_map = {
+                            "friendly_name": "friendly_name",
+                            "version": "version",
+                            "mac": "mac_address",
+                            "platform": "platform",
+                            "board": "board",
+                            "project_name": "project_name",
+                            "project_version": "project_version",
+                            "network": "network",
+                            "package_import_url": "package_import_url",
+                        }
+                        mapped = key_map.get(k, k)
+                        if v:
+                            esphome[mapped] = v
+
+            offset = rdata_start + rdlength
+
     except Exception:
         pass
-    return names, services
+    return names, services, esphome
 
 
 # ---------------------------------------------------------------------------

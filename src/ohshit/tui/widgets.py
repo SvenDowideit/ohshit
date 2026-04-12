@@ -230,6 +230,7 @@ class HostDetailTab(Widget):
         yield Label("", id="detail-vendor")
         yield Label("", id="detail-iot")
         yield Label("", id="detail-repurpose")
+        yield Label("", id="detail-esphome")
         yield Label("Open Ports:", id="ports-label")
         yield DataTable(id="ports-table")
 
@@ -243,7 +244,8 @@ class HostDetailTab(Widget):
                 "← Select a host from the list to see details"
             )
             for wid in ("detail-os", "detail-kernel", "detail-mac", "detail-ssh",
-                        "detail-seen", "detail-vendor", "detail-iot", "detail-repurpose"):
+                        "detail-seen", "detail-vendor", "detail-iot", "detail-repurpose",
+                        "detail-esphome"):
                 self.query_one(f"#{wid}", Label).update("")
             self.query_one("#ports-table", DataTable).clear(columns=False)
             return
@@ -329,6 +331,38 @@ class HostDetailTab(Widget):
             )
         else:
             self.query_one("#detail-repurpose", Label).update("")
+
+        # ESPHome device info
+        esp = host.iot_info.esphome_info
+        if esp:
+            parts: list[str] = []
+            if esp.get("friendly_name"):
+                parts.append(f"ESPHome: {esp['friendly_name']}")
+            elif esp.get("name"):
+                parts.append(f"ESPHome: {esp['name']}")
+            else:
+                parts.append("ESPHome device")
+            if esp.get("version"):
+                parts.append(f"v{esp['version']}")
+            if esp.get("model"):
+                parts.append(esp["model"])
+            if esp.get("platform") or esp.get("board"):
+                hw = "/".join(filter(None, [esp.get("platform"), esp.get("board")]))
+                parts.append(f"[{hw}]")
+            if esp.get("project_name"):
+                proj = esp["project_name"]
+                if esp.get("project_version"):
+                    proj += f" {esp['project_version']}"
+                parts.append(f"project: {proj}")
+            if esp.get("suggested_area"):
+                parts.append(f"area: {esp['suggested_area']}")
+            if esp.get("compilation_time"):
+                parts.append(f"built: {esp['compilation_time']}")
+            self.query_one("#detail-esphome", Label).update(
+                Text("  ".join(parts), style="cyan")
+            )
+        else:
+            self.query_one("#detail-esphome", Label).update("")
 
         tbl = self.query_one("#ports-table", DataTable)
         tbl.clear(columns=False)

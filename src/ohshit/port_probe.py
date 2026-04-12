@@ -242,6 +242,197 @@ async def _probe_generic(ip: str, port: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# ESPHome native API probe (port 6053)
+# ---------------------------------------------------------------------------
+
+def _varint_encode(v: int) -> bytes:
+    out = bytearray()
+    while v > 0x7F:
+        out.append((v & 0x7F) | 0x80)
+        v >>= 7
+    out.append(v)
+    return bytes(out)
+
+
+def _varint_decode(data: bytes, offset: int) -> tuple[int, int]:
+    """Return (value, new_offset)."""
+    result = 0
+    shift = 0
+    while offset < len(data):
+        b = data[offset]
+        offset += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            break
+        shift += 7
+    return result, offset
+
+
+def _make_api_packet(msg_type: int, payload: bytes = b"") -> bytes:
+    return b"\x00" + _varint_encode(len(payload)) + _varint_encode(msg_type) + payload
+
+
+def _parse_api_packet(data: bytes) -> tuple[int, bytes] | None:
+    """Return (msg_type, payload) or None if data is incomplete/invalid."""
+    if not data or data[0] != 0x00:
+        return None
+    try:
+        length, off = _varint_decode(data, 1)
+        msg_type, off = _varint_decode(data, off)
+        payload = data[off:off + length]
+        return msg_type, payload
+    except Exception:
+        return None
+
+
+def _parse_string_field(payload: bytes, field_number: int) -> str | None:
+    """Extract a single string field from a minimal protobuf payload."""
+    # Wire type 2 (length-delimited) tag = (field_number << 3) | 2
+    tag = (field_number << 3) | 2
+    i = 0
+    while i < len(payload):
+        try:
+            t, i = _varint_decode(payload, i)
+            wtype = t & 0x07
+            fnum = t >> 3
+            if wtype == 2:
+                length, i = _varint_decode(payload, i)
+                value = payload[i:i + length]
+                i += length
+                if fnum == field_number:
+                    return value.decode("utf-8", errors="replace")
+            elif wtype == 0:
+                _, i = _varint_decode(payload, i)
+            elif wtype == 5:
+                i += 4
+            elif wtype == 1:
+                i += 8
+            else:
+                break  # unknown wire type, bail
+        except Exception:
+            break
+    return None
+
+
+def _parse_all_string_fields(payload: bytes) -> dict[int, str]:
+    """Extract all string fields from a protobuf payload as {field_number: value}."""
+    result: dict[int, str] = {}
+    i = 0
+    while i < len(payload):
+        try:
+            t, i = _varint_decode(payload, i)
+            wtype = t & 0x07
+            fnum = t >> 3
+            if wtype == 2:
+                length, i = _varint_decode(payload, i)
+                value = payload[i:i + length]
+                i += length
+                try:
+                    text = value.decode("utf-8", errors="replace")
+                    if text.isprintable() or all(c.isprintable() or c in " \t" for c in text):
+                        result[fnum] = text
+                except Exception:
+                    pass
+            elif wtype == 0:
+                _, i = _varint_decode(payload, i)
+            elif wtype == 5:
+                i += 4
+            elif wtype == 1:
+                i += 8
+            else:
+                break
+        except Exception:
+            break
+    return result
+
+
+async def _probe_esphome_api(ip: str, port: int = 6053) -> dict[str, str]:
+    """Query ESPHome native API for device info without authentication.
+
+    Sends HelloRequest then DeviceInfoRequest; parses DeviceInfoResponse.
+    Returns a dict with keys: name, friendly_name, model, manufacturer,
+    esphome_version, compilation_time, project_name, project_version,
+    suggested_area, mac_address.
+    """
+    # HelloRequest (msg type 1): client_info field 1 = "ohshit-probe"
+    client_info = b"ohshit-probe"
+    hello_payload = b"\x0a" + _varint_encode(len(client_info)) + client_info
+    hello_pkt = _make_api_packet(1, hello_payload)
+    # DeviceInfoRequest (msg type 9): empty payload
+    devinfo_pkt = _make_api_packet(9)
+
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port), timeout=_TIMEOUT
+        )
+        try:
+            writer.write(hello_pkt)
+            await writer.drain()
+            # Read HelloResponse
+            hello_resp = await asyncio.wait_for(reader.read(256), timeout=_TIMEOUT)
+            if not hello_resp or hello_resp[0] == 0x01:
+                # 0x01 = Noise encryption required — can't probe without key
+                return {}
+            # Send DeviceInfoRequest
+            writer.write(devinfo_pkt)
+            await writer.drain()
+            # Read DeviceInfoResponse (may come in chunks)
+            devinfo_resp = await asyncio.wait_for(reader.read(1024), timeout=_TIMEOUT)
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+    except Exception:
+        return {}
+
+    parsed = _parse_api_packet(devinfo_resp)
+    if not parsed or parsed[0] != 10:  # 10 = DeviceInfoResponse
+        return {}
+
+    # Field numbers from ESPHome api.proto DeviceInfoResponse:
+    # 2=name, 3=mac_address, 4=esphome_version, 5=compilation_time,
+    # 6=model, 8=project_name, 9=project_version, 12=manufacturer,
+    # 13=friendly_name, 16=suggested_area
+    fields = _parse_all_string_fields(parsed[1])
+    field_names = {
+        2: "name", 3: "mac_address", 4: "esphome_version",
+        5: "compilation_time", 6: "model", 8: "project_name",
+        9: "project_version", 12: "manufacturer", 13: "friendly_name",
+        16: "suggested_area",
+    }
+    return {field_names[k]: v for k, v in fields.items() if k in field_names and v.strip()}
+
+
+async def _probe_esphome_web(ip: str, port: int = 80) -> dict[str, str]:
+    """Fetch ESPHome web server SSE /events stream initial ping for title/uptime."""
+    request = (
+        f"GET /events HTTP/1.0\r\nHost: {ip}\r\nAccept: text/event-stream\r\n\r\n"
+    ).encode()
+    raw = await _read_banner(ip, port, send=request, timeout=3.0)
+    if not raw:
+        return {}
+    text = raw.decode("utf-8", errors="replace")
+    # Look for the SSE ping JSON: data: {"title": "...", ...}
+    m = re.search(r'data:\s*(\{[^}]+\})', text)
+    if not m:
+        return {}
+    try:
+        import json as _json
+        obj = _json.loads(m.group(1))
+        result = {}
+        if obj.get("title"):
+            result["friendly_name"] = obj["title"]
+        if obj.get("uptime") is not None:
+            mins = int(float(obj["uptime"])) // 60
+            result["uptime"] = f"{mins // 60}h {mins % 60}m" if mins >= 60 else f"{mins}m"
+        return result
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------------------
 # Device/OS identity extraction from version strings
 # ---------------------------------------------------------------------------
 
@@ -304,26 +495,41 @@ def _apply_identity(host: "Host", version: str) -> None:
 async def probe_ports(host: "Host") -> None:
     """Probe each open port to fill in PortInfo.version and update host identity.
 
-    Only probes ports that don't already have a version string (so SSH-collected
-    data isn't overwritten) and skips ports with no external connection.
+    Also runs ESPHome-specific probes when port 6053 is open or when an HTTP
+    port responds like an ESPHome web server.
     """
     if not host.open_ports:
         return
 
     sem = asyncio.Semaphore(10)
+    port_numbers = {p.port for p in host.open_ports}
 
     async def _probe_one(port_info: "PortInfo") -> None:
         async with sem:
             port = port_info.port
             version = port_info.version or ""
 
-            # Determine probe type
+            if port == 6053:
+                # ESPHome native API — richer than any banner
+                info = await _probe_esphome_api(host.ip, port)
+                if info:
+                    _apply_esphome_info(host, info)
+                    port_info.version = "ESPHome native API"
+                    port_info.service = port_info.service or "esphomelib"
+                return
+
             if port == 22 or port_info.service == "ssh":
                 result = await _probe_ssh(host.ip, port)
             elif port in _HTTPS_PORTS or port_info.service in ("https", "https-alt"):
                 result = await _probe_http(host.ip, port, tls=True)
             elif port in _HTTP_PORTS or port_info.service in ("http", "http-alt"):
                 result = await _probe_http(host.ip, port, tls=False)
+                # If this HTTP port might be an ESPHome web server, try /events
+                if result and ("ESPHome" in result or "esphome" in result.lower()
+                               or 6053 in port_numbers):
+                    web_info = await _probe_esphome_web(host.ip, port)
+                    if web_info:
+                        _apply_esphome_info(host, web_info)
             elif port == 21 or port_info.service == "ftp":
                 result = await _probe_ftp(host.ip, port)
             elif port in (25, 587, 465) or port_info.service == "smtp":
@@ -336,12 +542,53 @@ async def probe_ports(host: "Host") -> None:
                 result = await _probe_generic(host.ip, port)
 
             if result:
-                # Merge with existing version rather than overwriting
                 if version and version not in result:
                     port_info.version = f"{version}  {result}"
                 else:
                     port_info.version = result
                 _apply_identity(host, result)
 
-    await asyncio.gather(*[_probe_one(p) for p in host.open_ports],
-                         return_exceptions=True)
+    # Run all port probes concurrently, then run ESPHome API probe if port present
+    tasks = [_probe_one(p) for p in host.open_ports]
+
+    # If 6053 is not already in open_ports but we suspect ESPHome (e.g. from
+    # mDNS detection or Espressif OUI), try port 6053 anyway
+    is_esphome = (
+        6053 in port_numbers
+        or "esphome" in " ".join(host.iot_info.detection_methods).lower()
+        or "esphomelib" in " ".join(host.iot_info.mdns_services).lower()
+        or (host.iot_info.vendor or "").lower() in ("espressif", "espressif inc.")
+    )
+    if is_esphome and 6053 not in port_numbers:
+        async def _try_esphome_api() -> None:
+            async with sem:
+                info = await _probe_esphome_api(host.ip, 6053)
+                if info:
+                    _apply_esphome_info(host, info)
+        tasks.append(_try_esphome_api())
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _apply_esphome_info(host: "Host", info: dict[str, str]) -> None:
+    """Merge ESPHome device info dict into host fields."""
+    if not info:
+        return
+    existing = host.iot_info.esphome_info
+    existing.update({k: v for k, v in info.items() if v})
+
+    # Populate standard host/iot fields from ESPHome data
+    if not host.iot_info.device_type:
+        host.iot_info.device_type = "ESPHome Device"
+    if not host.iot_info.vendor and info.get("manufacturer"):
+        host.iot_info.vendor = info["manufacturer"]
+    if not host.os_guess and info.get("esphome_version"):
+        host.os_guess = f"ESPHome {info['esphome_version']}"
+
+    # Use friendly_name or name as the mDNS display name if not set
+    display = info.get("friendly_name") or info.get("name")
+    if display and display not in host.iot_info.mdns_names:
+        host.iot_info.mdns_names.insert(0, display)
+
+    if "esphome-api" not in host.iot_info.detection_methods:
+        host.iot_info.detection_methods.append("esphome-api")

@@ -83,6 +83,7 @@ class IotInfo:
     mqtt_topics: list[str] = field(default_factory=list)
     banner_grabs: dict[int, str] = field(default_factory=dict)  # port→banner
     detection_methods: list[str] = field(default_factory=list)
+    esphome_info: dict[str, str] = field(default_factory=dict)  # ESPHome device info
 
 
 @dataclass
