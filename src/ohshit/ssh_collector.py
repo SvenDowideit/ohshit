@@ -288,8 +288,7 @@ class LocalCollector:
         try:
             raw = await self._run_commands()
             await self._check_shadow(raw)
-            host.state = HostState.SSH_SUCCESS
-            # Mark clearly that this was local collection
+            host.state = HostState.LOCAL
             host.ssh_error = None
             return raw
         except Exception as exc:

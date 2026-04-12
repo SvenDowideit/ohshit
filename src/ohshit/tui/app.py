@@ -468,34 +468,43 @@ class OhShitApp(App[None]):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                from ..vuln_db import query_vulns_for_packages, refresh_kev, kev_ids
-                # Refresh KEV catalog first (fast, ~200 KB)
-                self._thread_safe_progress("Vuln: fetching KEV…", 5)
-                refresh_kev(log_cb=self._thread_safe_log)
-                # Then query OSV for this host's packages
+                from ..vuln_db import query_vulns_for_packages, refresh_kev, kev_ids, match_packages_to_vulns
                 name = host.display_name if host else ip
-                self._thread_safe_progress(f"Vuln: querying OSV for {name}…", 20)
-                matches = loop.run_until_complete(
-                    query_vulns_for_packages(packages, log_cb=self._thread_safe_log)
-                )
-                total = sum(len(v) for v in matches.values())
-                self._thread_safe_log(
-                    f"[dim]Vuln:[/dim] {name} — "
-                    f"{total} CVEs across {len(matches)} packages"
-                )
+
+                # Try local cache first — no network needed if we already have data
+                self._thread_safe_progress(f"Vuln: reading cache for {name}…", 10)
+                matches = match_packages_to_vulns(packages)
+
+                if matches:
+                    total = sum(len(v) for v in matches.values())
+                    self._thread_safe_log(
+                        f"[dim]Vuln:[/dim] {name} — {total} CVEs from cache "
+                        f"({len(matches)} packages)"
+                    )
+                else:
+                    # Nothing cached — fetch from network
+                    self._thread_safe_progress("Vuln: fetching KEV…", 5)
+                    refresh_kev(log_cb=self._thread_safe_log)
+                    self._thread_safe_progress(f"Vuln: querying OSV for {name}…", 20)
+                    matches = loop.run_until_complete(
+                        query_vulns_for_packages(packages, log_cb=self._thread_safe_log)
+                    )
+                    total = sum(len(v) for v in matches.values())
+                    self._thread_safe_log(
+                        f"[dim]Vuln:[/dim] {name} — {total} CVEs across {len(matches)} packages"
+                    )
+                    writer = DB.open_writer(self._db_path)
+                    DB.save_vuln_cache(writer, ip, matches)
+                    writer.close()
+
                 self._thread_safe_progress(f"Vuln: {name} — {total} CVEs", 90)
-                # Persist, update risk findings, refresh UI
                 self._vuln_matches[ip] = matches
                 kev = kev_ids()
                 self._kev_ids = kev
                 self._apply_vuln_findings(ip, matches, kev)
-                writer = DB.open_writer(self._db_path)
-                DB.save_vuln_cache(writer, ip, matches)
-                writer.close()
                 DB.data_changed.set()
                 self._thread_safe_progress("Vuln: done", 100)
             except Exception as exc:
-                import traceback
                 self._thread_safe_log(f"[bold red]Vuln query error:[/bold red] {exc}")
                 self._thread_safe_progress("Vuln: error", 100)
             finally:

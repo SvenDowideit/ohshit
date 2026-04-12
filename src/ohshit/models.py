@@ -20,6 +20,7 @@ class HostState(str, Enum):
     SCANNING = "Scanning"
     SSH_SUCCESS = "SSH OK"
     SSH_FAILED = "SSH Failed"
+    LOCAL = "Local"
 
 
 @dataclass
