@@ -82,6 +82,7 @@ class OhShitApp(App[None]):
         Binding("s", "rescan_selected", "Re-scan Host", show=True),
         Binding("b", "collect_sbom", "Collect SBOM", show=True),
         Binding("v", "query_vulns", "Query Vulns", show=True),
+        Binding("V", "refresh_all_vulns", "Refresh All Vulns", show=True),
         Binding("e", "export_report", "Export Report", show=True),
         Binding("q", "quit", "Quit", show=True),
     ]
@@ -511,6 +512,71 @@ class OhShitApp(App[None]):
                 loop.close()
 
         threading.Thread(target=_vuln_thread, daemon=True, name="ohshit-vulns").start()
+
+    def action_refresh_all_vulns(self) -> None:
+        """Force-download fresh KEV + OSV data for every host with an SBOM."""
+        hosts_with_sbom = {
+            ip: pkgs for ip, pkgs in self._sbom_packages.items() if pkgs
+        }
+        if not hosts_with_sbom:
+            self._log("[yellow]No SBOM data yet — collect SBOMs first ([bold]b[/bold]).[/yellow]")
+            return
+        self._log(
+            f"[cyan]Forcing full vulnerability refresh for "
+            f"{len(hosts_with_sbom)} host(s)…[/cyan]"
+        )
+
+        def _refresh_all_thread() -> None:
+            import asyncio
+            from ..vuln_db import query_vulns_for_packages, refresh_kev, kev_ids
+
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                total_hosts = len(hosts_with_sbom)
+
+                # Step 1: refresh KEV catalog
+                self._thread_safe_progress("Vuln refresh: fetching KEV…", 2)
+                refresh_kev(log_cb=self._thread_safe_log)
+                kev = kev_ids()
+                self._kev_ids = kev
+
+                # Step 2: query OSV for each host's packages
+                writer = DB.open_writer(self._db_path)
+                for idx, (ip, packages) in enumerate(hosts_with_sbom.items()):
+                    host = self._hosts.get(ip)
+                    name = host.display_name if host else ip
+                    pct = 5 + int(idx / total_hosts * 90)
+                    self._thread_safe_progress(f"Vuln refresh: {name}…", pct)
+                    try:
+                        matches = loop.run_until_complete(
+                            query_vulns_for_packages(packages, log_cb=self._thread_safe_log)
+                        )
+                        total_cves = sum(len(v) for v in matches.values())
+                        self._thread_safe_log(
+                            f"[dim]Vuln:[/dim] {name} — {total_cves} CVEs "
+                            f"across {len(matches)} packages"
+                        )
+                        self._vuln_matches[ip] = matches
+                        self._apply_vuln_findings(ip, matches, kev)
+                        DB.save_vuln_cache(writer, ip, matches)
+                        DB.data_changed.set()
+                    except Exception as exc:
+                        self._thread_safe_log(
+                            f"[dim red]Vuln:[/dim red] {name} — refresh failed: {exc}"
+                        )
+                writer.close()
+                self._thread_safe_progress("Vuln refresh: done", 100)
+                self._thread_safe_log(
+                    f"[green]Vulnerability refresh complete for {total_hosts} host(s).[/green]"
+                )
+            except Exception as exc:
+                self._thread_safe_log(f"[bold red]Vuln refresh error:[/bold red] {exc}")
+                self._thread_safe_progress("Vuln refresh: error", 100)
+            finally:
+                loop.close()
+
+        threading.Thread(target=_refresh_all_thread, daemon=True, name="ohshit-vulns-all").start()
 
     async def action_export_report(self) -> None:
         if not self._hosts:
