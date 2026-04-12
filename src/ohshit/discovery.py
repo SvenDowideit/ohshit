@@ -371,3 +371,71 @@ async def _resolve_hostname(host: Host) -> None:
         host.hostname = name
     except Exception:
         pass
+
+
+# Common ports to probe when nmap is unavailable or SSH is inaccessible.
+# Ordered roughly by likelihood of being open on a home network device.
+_COMMON_PORTS: list[tuple[int, str]] = [
+    (22,   "ssh"),
+    (80,   "http"),
+    (443,  "https"),
+    (8080, "http-alt"),
+    (8443, "https-alt"),
+    (8123, "home-assistant"),
+    (21,   "ftp"),
+    (23,   "telnet"),
+    (25,   "smtp"),
+    (53,   "domain"),
+    (110,  "pop3"),
+    (143,  "imap"),
+    (445,  "microsoft-ds"),
+    (3389, "ms-wbt-server"),
+    (5900, "vnc"),
+    (5901, "vnc-1"),
+    (6443, "sun-sr-https"),
+    (8008, "http"),
+    (8883, "secure-mqtt"),
+    (1883, "mqtt"),
+    (9100, "jetdirect"),
+    (631,  "ipp"),
+    (3000, "http"),
+    (3001, "http"),
+    (4443, "https"),
+    (9090, "http"),
+    (9443, "https"),
+    (32400, "plex"),
+    (7474,  "http"),   # Neo4j
+    (5432,  "postgresql"),
+    (3306,  "mysql"),
+    (6379,  "redis"),
+    (27017, "mongodb"),
+]
+
+
+async def tcp_port_scan(ip: str, timeout: float = 1.0) -> list[PortInfo]:
+    """Async TCP connect scan on common ports. Used when nmap is unavailable
+    or for hosts where SSH failed. Much faster than nmap for a fixed port list."""
+    sem = asyncio.Semaphore(30)
+    results: list[PortInfo] = []
+
+    async def _probe(port: int, service: str) -> None:
+        async with sem:
+            try:
+                _, writer = await asyncio.wait_for(
+                    asyncio.open_connection(ip, port), timeout=timeout
+                )
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                results.append(PortInfo(
+                    port=port, protocol="tcp", state="open",
+                    service=service, version="",
+                ))
+            except Exception:
+                pass
+
+    await asyncio.gather(*[_probe(p, s) for p, s in _COMMON_PORTS])
+    results.sort(key=lambda p: p.port)
+    return results

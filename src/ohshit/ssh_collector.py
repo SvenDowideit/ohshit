@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from typing import Any, Callable
 
-from .models import Host, HostState
+from .models import Host, HostState, PortInfo
 
 
 RAW_COMMANDS: dict[str, str] = {
@@ -105,11 +106,10 @@ class RemoteCollector:
 
 
 def _apply_os_release(host: Host, raw: dict) -> None:
-    """Parse uname + os-release data from raw SSH output into host fields."""
+    """Parse uname + os-release + ss output from raw SSH data into host fields."""
     uname = raw.get("uname", "")
     if uname:
         parts = uname.split()
-        # uname -a: kernel name, nodename, release, version, machine, ...
         if len(parts) >= 3:
             host.kernel_version = parts[2]
         if len(parts) >= 1:
@@ -126,6 +126,103 @@ def _apply_os_release(host: Host, raw: dict) -> None:
         if parsed:
             host.os_release = parsed
             host.os_guess = host.os_guess or parsed.get("PRETTY_NAME") or parsed.get("NAME")
+
+    # Parse ss/netstat listening ports into open_ports.
+    # Keep nmap-discovered ports for any port ss doesn't report (e.g. UDP).
+    ss_ports = _parse_ss_ports(raw.get("listening_ports", ""))
+    if ss_ports:
+        # Merge: ss wins for TCP (it has process names); keep existing non-TCP ports
+        existing_non_tcp = [p for p in host.open_ports if p.protocol != "tcp"]
+        host.open_ports = ss_ports + existing_non_tcp
+
+
+def _parse_ss_ports(ss_output: str) -> list[PortInfo]:
+    """Parse `ss -tlnp` or `netstat -tlnp` output into PortInfo list.
+
+    ss -tlnp columns (no Netid since -t filters to tcp):
+      State  Recv-Q  Send-Q  Local Address:Port  Peer Address:Port  [Process]
+
+    netstat -tlnp columns:
+      Proto  Recv-Q  Send-Q  Local Address  Foreign Address  State  [PID/prog]
+    """
+    ports: list[PortInfo] = []
+    seen: set[int] = set()
+
+    for line in ss_output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+
+        local_addr: str | None = None
+        service_hint = ""
+
+        # Detect format by first token
+        first = parts[0].lower()
+
+        if first in ("tcp", "tcp6", "udp", "udp6"):
+            # netstat format: proto recv-q send-q local foreign state [pid/prog]
+            if len(parts) < 4:
+                continue
+            local_addr = parts[3]
+            if len(parts) >= 7:
+                prog_field = parts[6]
+                service_hint = prog_field.split("/")[-1] if "/" in prog_field else ""
+
+        elif first in ("listen", "estab", "time-wait", "close-wait"):
+            # ss format (no Netid column): state recv-q send-q local peer [process]
+            if len(parts) < 4:
+                continue
+            local_addr = parts[3]
+            if len(parts) >= 6:
+                m = re.search(r'"([^"]+)"', parts[5])
+                if m:
+                    service_hint = m.group(1)
+
+        elif first.startswith("netid") or first.startswith("state") or first.startswith("active") or first.startswith("proto"):
+            continue  # header lines
+
+        else:
+            # ss format WITH Netid column (e.g. when run without -t):
+            # netid state recv-q send-q local peer [process]
+            if first in ("tcp", "udp") or len(parts) >= 5:
+                if len(parts) >= 5:
+                    local_addr = parts[4]
+                if len(parts) >= 7:
+                    m = re.search(r'"([^"]+)"', parts[6])
+                    if m:
+                        service_hint = m.group(1)
+
+        if not local_addr:
+            continue
+
+        # Extract port: last colon-separated segment
+        port_str = local_addr.rsplit(":", 1)[-1]
+        if not port_str.isdigit():
+            continue
+        port = int(port_str)
+        if port == 0 or port in seen:
+            continue
+        seen.add(port)
+
+        if not service_hint:
+            try:
+                service_hint = __import__("socket").getservbyport(port, "tcp")
+            except OSError:
+                service_hint = ""
+
+        ports.append(PortInfo(
+            port=port,
+            protocol="tcp",
+            state="open",
+            service=service_hint,
+            version="",
+        ))
+
+    return sorted(ports, key=lambda p: p.port)
 
 
 def _summarise_error(exc: Exception) -> str:

@@ -43,7 +43,7 @@ from textual.reactive import reactive
 from textual.widgets import Footer, Header, Label, TabbedContent, TabPane
 
 from .. import db as DB
-from ..discovery import discover_all
+from ..discovery import discover_all, tcp_port_scan
 from ..iot import detect_iot, passive_network_scan
 from ..models import Host, IotInfo, ScanResult, Severity
 from ..report import generate_markdown_report
@@ -442,6 +442,17 @@ async def _scanner_async(
             if raw:
                 _apply_os_release(host, raw)
                 host.last_scan = datetime.now()
+
+        # For hosts where SSH didn't run or failed, do a TCP connect scan
+        # to populate open_ports (nmap may have already done this during
+        # discovery, but single-IP rescans and --no-ssh mode skip nmap).
+        ssh_gave_ports = bool(raw) and bool(host.open_ports)
+        nmap_gave_ports = host.open_ports and not raw
+        if not ssh_gave_ports and not nmap_gave_ports and host.state.value != "Unreachable":
+            async with iot_sem:  # reuse semaphore to limit concurrent scanners
+                scanned = await tcp_port_scan(host.ip)
+                if scanned:
+                    host.open_ports = scanned
 
         # Risk analysis
         host.findings = risk_engine.analyze(host, raw)
