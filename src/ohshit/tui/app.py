@@ -65,6 +65,7 @@ from .widgets import (
     RemediationPanel,
     SbomTab,
     ScanProgressBar,
+    VulnTab,
 )
 
 CSS_PATH = Path(__file__).with_name("app.tcss")
@@ -80,6 +81,7 @@ class OhShitApp(App[None]):
         Binding("r", "rescan_all", "Re-scan All", show=True),
         Binding("s", "rescan_selected", "Re-scan Host", show=True),
         Binding("b", "collect_sbom", "Collect SBOM", show=True),
+        Binding("v", "query_vulns", "Query Vulns", show=True),
         Binding("e", "export_report", "Export Report", show=True),
         Binding("q", "quit", "Quit", show=True),
     ]
@@ -109,6 +111,8 @@ class OhShitApp(App[None]):
         self._hosts: dict[str, Host] = {}
         # Cache: ip -> list[dict] packages for the SBOM tab
         self._sbom_packages: dict[str, list[dict]] = {}
+        # Cache: ip -> vuln_matches dict for the Vulns tab
+        self._vuln_matches: dict[str, dict[str, list[dict]]] = {}
 
     # ------------------------------------------------------------------
     # Layout
@@ -128,6 +132,8 @@ class OhShitApp(App[None]):
                         yield RemediationPanel(id="remediation-panel")
                     with TabPane("SBOM", id="tab-sbom"):
                         yield SbomTab(id="sbom-tab")
+                    with TabPane("Vulnerabilities", id="tab-vulns"):
+                        yield VulnTab(id="vuln-tab")
         with Vertical(id="bottom-panel"):
             yield ScanProgressBar(id="scan-progress")
             yield LogFeed(id="log-feed")
@@ -141,6 +147,8 @@ class OhShitApp(App[None]):
         self.title = "Oh-Shit Network Security Dashboard"
         # Refresh OUI cache in background (non-blocking; falls back to mini-table)
         threading.Thread(target=self._refresh_oui_cache, daemon=True, name="oui-cache").start()
+        # Load cached vuln matches in background so the UI isn't blocked
+        threading.Thread(target=self._refresh_vuln_cache_bg, daemon=True, name="vuln-cache").start()
         # Open reader connection
         self._reader = DB.open_reader(self._db_path)
         # Load whatever is already in the DB immediately
@@ -156,6 +164,28 @@ class OhShitApp(App[None]):
         from ..oui_db import refresh_cache
         if refresh_cache():
             self._thread_safe_log("[dim]OUI vendor database ready.[/dim]")
+
+    def _refresh_vuln_cache_bg(self) -> None:
+        """Load previously-fetched vuln matches from the local cache into memory.
+        Runs in a background thread so it never blocks the UI."""
+        try:
+            from ..vuln_db import match_packages_to_vulns
+            # Wait briefly for _poll_db to populate _sbom_packages first
+            import time
+            time.sleep(0.5)
+            updated = 0
+            for ip, packages in list(self._sbom_packages.items()):
+                matches = match_packages_to_vulns(packages)
+                if matches:
+                    self._vuln_matches[ip] = matches
+                    updated += 1
+            if updated:
+                self._thread_safe_log(
+                    f"[dim]Vuln:[/dim] Loaded cached vulnerability data for {updated} host(s)"
+                )
+                DB.data_changed.set()
+        except Exception:
+            pass
 
     def on_unmount(self) -> None:
         if self._reader:
@@ -247,7 +277,10 @@ class OhShitApp(App[None]):
         # SBOM tab — load from cached packages dict
         sbom_widget = self.query_one("#sbom-tab", SbomTab)
         packages = self._sbom_packages.get(host.ip, [])
-        sbom_widget.update_sbom(packages, host)
+        vuln_matches = self._vuln_matches.get(host.ip, {})
+        sbom_widget.update_sbom(packages, host, vuln_matches)
+        # Vulns tab
+        self.query_one("#vuln-tab", VulnTab).update_vulns(vuln_matches, host)
 
     # ------------------------------------------------------------------
     # Actions
@@ -301,6 +334,45 @@ class OhShitApp(App[None]):
                 DB.data_changed.set()
 
         threading.Thread(target=_sbom_thread, daemon=True, name="ohshit-sbom").start()
+
+    def action_query_vulns(self) -> None:
+        """Query OSV for vulnerabilities matching the selected host's SBOM packages."""
+        if not self.selected_ip:
+            self._log("[yellow]No host selected.[/yellow]")
+            return
+        packages = self._sbom_packages.get(self.selected_ip, [])
+        if not packages:
+            self._log("[yellow]No SBOM data for this host — collect SBOM first ([bold]b[/bold]).[/yellow]")
+            return
+        host = self._hosts.get(self.selected_ip)
+        ip = self.selected_ip
+
+        def _vuln_thread() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                from ..vuln_db import query_vulns_for_packages, refresh_kev
+                # Refresh KEV catalog first (fast, ~200 KB)
+                refresh_kev(log_cb=self._thread_safe_log)
+                # Then query OSV for this host's packages
+                matches = loop.run_until_complete(
+                    query_vulns_for_packages(packages, log_cb=self._thread_safe_log)
+                )
+                total = sum(len(v) for v in matches.values())
+                self._thread_safe_log(
+                    f"[dim]Vuln:[/dim] {host.display_name if host else ip} — "
+                    f"{total} CVEs across {len(matches)} packages"
+                )
+                # Store in cache and refresh UI
+                self._vuln_matches[ip] = matches
+                DB.data_changed.set()
+            except Exception as exc:
+                import traceback
+                self._thread_safe_log(f"[bold red]Vuln query error:[/bold red] {exc}")
+            finally:
+                loop.close()
+
+        threading.Thread(target=_vuln_thread, daemon=True, name="ohshit-vulns").start()
 
     async def action_export_report(self) -> None:
         if not self._hosts:

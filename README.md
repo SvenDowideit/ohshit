@@ -6,7 +6,7 @@ steps, and a full Software Bill of Materials (SBOM) for every host.
 
 ```
 ┌─ Oh-Shit Network Security Dashboard ──────────── High risk (score 22) ─┐
-│ Hosts          │ Host Details  │ Findings  │ Remediation  │ SBOM        │
+│ Hosts          │ Host Details  │ Findings  │ Remediation  │ SBOM  │ Vulns│
 │                │                                                        │
 │ CRIT router    │  192.168.1.1 (router) — Critical risk (score 32)      │
 │ HIGH myserver  │  OS: OpenWrt 23.05                                     │
@@ -20,7 +20,7 @@ steps, and a full Software Bill of Materials (SBOM) for every host.
 │────────────────────────────────────────────────────────────────────────│
 │ [SSH: myserver]                                              [████  80%]│
 │ 14:32:07 Discovery done: 8 hosts found                                  │
-└────────────── r:Re-scan  s:Re-scan host  e:Export  q:Quit ─────────────┘
+└────────── r:Re-scan  s:Re-scan host  b:SBOM  v:Vulns  e:Export  q:Quit ┘
 ```
 
 ## Quick start
@@ -188,7 +188,49 @@ The [DuckLake](https://ducklake.select/) extension provides a unified catalog
 view across all per-host databases. It is installed automatically by DuckDB on
 first run (`INSTALL ducklake`).
 
-### 6 — Dashboard
+### 6 — Vulnerability matching
+
+After SBOM collection, press `v` to query public vulnerability databases for
+every package on the selected host.  Results are cached locally and shown
+immediately on subsequent launches.
+
+#### Sources
+
+| Source | What it covers | Auth required |
+|--------|---------------|---------------|
+| [OSV](https://osv.dev/) (Google) | Debian, Ubuntu, PyPI, Red Hat, openSUSE, Alpine, Rocky Linux, AlmaLinux, Fedora, npm, Cargo, Go, RubyGems, NuGet, and 30+ more ecosystems | None |
+| [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) (CISA) | ~1,500 CVEs with confirmed active exploitation in the wild | None |
+
+Snap, Flatpak, and container image tags are not indexed by OSV and produce no
+results.
+
+#### Ecosystem mapping
+
+| SBOM source | OSV ecosystems queried |
+|-------------|----------------------|
+| `dpkg` | Debian, Ubuntu |
+| `rpm` | Red Hat, openSUSE, AlmaLinux, Rocky Linux, Fedora |
+| `pip` | PyPI |
+| `snap` | — (not indexed) |
+| `flatpak` | — (not indexed) |
+| `docker` | — (image tags not indexed) |
+
+#### Cache
+
+Vulnerability data is cached in `~/.cache/ohshit/vuln.duckdb` — separate from
+the per-project `ohshit.db` so it is shared across runs and reused when you
+re-scan different subnets.
+
+#### Display
+
+- **SBOM tab** — adds a `CVEs` column showing the count of matching advisories
+  per package (shown in red when non-zero).
+- **Vulnerabilities tab** — full advisory table with advisory ID, a `★` badge
+  for entries in the CISA KEV catalog (actively exploited), severity, CVSS
+  score, affected package, and summary text.  Packages with the most CVEs are
+  listed first.
+
+### 7 — Dashboard
 
 The Textual TUI refreshes as data arrives:
 
@@ -197,9 +239,11 @@ The Textual TUI refreshes as data arrives:
   - *Host Details* — IP, MAC, OS, kernel, vendor, IoT identifiers, open ports
   - *Findings* — table of all findings sorted by severity
   - *Remediation* — copy-pasteable fix commands for each finding
-  - *SBOM* — package inventory for the selected host, showing source, name,
-    version, type, and architecture; header shows collection timestamp and
+  - *SBOM* — package inventory for the selected host, showing release age, source, name,
+    version, architecture, and CVE count; header shows collection timestamp and
     total package count
+  - *Vulnerabilities* — CVE advisory list for the selected host's packages,
+    with KEV active-exploitation badge (★), severity, CVSS score, and summary
 - **Bottom** — scan progress bar and live log
 
 #### Keyboard shortcuts
@@ -209,6 +253,7 @@ The Textual TUI refreshes as data arrives:
 | `r` | Re-scan all hosts |
 | `s` | Re-scan the selected host |
 | `b` | Force SBOM collection for the selected host (bypasses the 24 h age check) |
+| `v` | Query vulnerability databases for the selected host's SBOM packages |
 | `e` | Export Markdown report to `~/network-security-report-<timestamp>.md` |
 | `q` | Quit |
 
@@ -234,6 +279,10 @@ tracked in a separate append-only history table to detect hardware repurposing.
 SBOM databases accumulate in the `sbom/` directory next to the main database
 and are never automatically removed.
 
+Vulnerability data is cached in `~/.cache/ohshit/vuln.duckdb` and is shared
+across all projects and runs.  It is never automatically purged — press `v`
+to refresh it on demand.
+
 ## Project layout
 
 ```
@@ -243,14 +292,15 @@ src/ohshit/
   ssh_collector.py   asyncssh remote command collection + SBOM command definitions
   risk_engine.py     Scoring rules → Finding objects
   sbom.py            SBOM collection, parsing, per-host DuckDB storage, DuckLake catalog
+  vuln_db.py         Vulnerability cache — OSV + CISA KEV, local DuckDB at ~/.cache/ohshit/vuln.duckdb
   port_probe.py      Deep port banner / TLS / ESPHome probing
   iot.py             mDNS sniff, UPnP/SSDP, Home Assistant, IoT device detection
   oui_db.py          MAC OUI vendor lookup and MAC permanence classification
   report.py          Markdown report generator
   main.py            CLI entry point
   tui/
-    app.py           Textual App, scanner pipeline, DB polling, SBOM wiring
-    widgets.py       Custom widgets: host list, findings table, SBOM tab, etc.
+    app.py           Textual App, scanner pipeline, DB polling, SBOM/vuln wiring
+    widgets.py       Custom widgets: host list, findings table, SBOM tab, vuln tab, etc.
     app.tcss         Textual CSS layout and theming
 ```
 
@@ -260,9 +310,9 @@ src/ohshit/
 |---------|---------|
 | [Textual](https://textual.textualize.io/) | Terminal UI framework |
 | [asyncssh](https://asyncssh.readthedocs.io/) | Async SSH client for remote collection |
-| [DuckDB](https://duckdb.org/) | Embedded analytics database (hosts, findings, SBOM) |
+| [DuckDB](https://duckdb.org/) | Embedded analytics database (hosts, findings, SBOM, vuln cache) |
 | [DuckLake](https://ducklake.select/) | Catalog layer unifying per-host SBOM databases (DuckDB extension, auto-installed) |
-| [aiohttp](https://docs.aiohttp.org/) | Async HTTP for Home Assistant and UPnP probing |
+| [aiohttp](https://docs.aiohttp.org/) | Async HTTP for Home Assistant, UPnP probing, and OSV API queries |
 | [aiofiles](https://github.com/Tinche/aiofiles) | Async file I/O for report export |
 | [cryptography](https://cryptography.io/) | TLS certificate inspection |
 | [rich](https://rich.readthedocs.io/) | Terminal formatting (used by Textual) |
@@ -291,3 +341,7 @@ which the UI thread reads without locking.
   (open ports, package versions, account names). Treat it accordingly.
 - SBOM databases stored in `sbom/` contain full package inventories for each
   host. Restrict access to this directory appropriately.
+- Vulnerability queries are sent to `api.osv.dev` (Google) and
+  `www.cisa.gov` — the package names and versions of every installed package
+  on your hosts are transmitted. Do not use `v` on air-gapped networks or
+  where package inventory must remain confidential.

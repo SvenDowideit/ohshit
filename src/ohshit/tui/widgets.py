@@ -477,11 +477,19 @@ class SbomTab(Widget):
 
     def on_mount(self) -> None:
         tbl = self.query_one("#sbom-table", DataTable)
-        tbl.add_columns("Released", "Source", "Name", "Version", "Arch")
+        tbl.add_columns("Released", "Source", "Name", "Version", "Arch", "CVEs")
         tbl.cursor_type = "row"
 
-    def update_sbom(self, packages: list[dict], host: "Host | None" = None) -> None:
-        """Refresh the SBOM display with the given package list."""
+    def update_sbom(
+        self,
+        packages: list[dict],
+        host: "Host | None" = None,
+        vuln_matches: "dict[str, list[dict]] | None" = None,
+    ) -> None:
+        """Refresh the SBOM display with the given package list.
+
+        vuln_matches is {source:name:version: [advisory_dict, ...]} from vuln_db.
+        """
         tbl = self.query_one("#sbom-table", DataTable)
         tbl.clear(columns=False)
 
@@ -497,13 +505,14 @@ class SbomTab(Widget):
         ts_str = _fmt_ts(collected_at) if collected_at else "unknown"
         count = len(packages)
         host_name = packages[0].get("hostname") or packages[0].get("ip", "")
-        hdr.update(f"{host_name}  —  {count} packages  (collected {ts_str})")
 
-        now = datetime.now(timezone.utc)
+        # Summarise vuln counts for the header
+        total_vulns = sum(len(v) for v in (vuln_matches or {}).values())
+        vuln_str = f"  |  {total_vulns} CVEs" if total_vulns else ""
+        hdr.update(f"{host_name}  —  {count} packages  (collected {ts_str}){vuln_str}")
 
         def _sort_key(p: dict):
             ra = p.get("released_at")
-            # Packages with no date sort to the end (oldest-looking)
             if ra is None:
                 return datetime.min.replace(tzinfo=timezone.utc)
             if ra.tzinfo is None:
@@ -519,10 +528,107 @@ class SbomTab(Widget):
                     ra = ra.replace(tzinfo=timezone.utc)
                 age_str = _ago(ra)
 
+            key = f"{pkg.get('source', '')}:{pkg.get('name', '')}:{pkg.get('version', '')}"
+            advisories = (vuln_matches or {}).get(key, [])
+            if advisories:
+                cve_text = Text(str(len(advisories)), style="bold red")
+            else:
+                cve_text = Text("")
+
             tbl.add_row(
                 age_str,
                 pkg.get("source", ""),
                 pkg.get("name", ""),
                 pkg.get("version", ""),
                 pkg.get("arch", ""),
+                cve_text,
             )
+
+
+# ---------------------------------------------------------------------------
+# VulnTab
+# ---------------------------------------------------------------------------
+
+class VulnTab(Widget):
+    """Shows vulnerability advisories matched against the selected host's SBOM."""
+
+    def compose(self) -> ComposeResult:
+        yield Label("", id="vuln-header")
+        yield DataTable(id="vuln-table")
+
+    def on_mount(self) -> None:
+        tbl = self.query_one("#vuln-table", DataTable)
+        tbl.add_columns("ID", "KEV", "Severity", "CVSS", "Package", "Summary")
+        tbl.cursor_type = "row"
+
+    def update_vulns(
+        self,
+        vuln_matches: "dict[str, list[dict]]",
+        host: "Host | None" = None,
+    ) -> None:
+        """Populate the table from vuln_matches {source:name:ver: [advisory, ...]}."""
+        tbl = self.query_one("#vuln-table", DataTable)
+        tbl.clear(columns=False)
+        hdr = self.query_one("#vuln-header", Label)
+
+        if not vuln_matches:
+            msg = "No vulnerability data" if host is None else f"No CVEs found for {host.display_name if host else ''}"
+            if host and not vuln_matches:
+                msg += " — press [bold]v[/bold] to query OSV"
+            hdr.update(msg)
+            return
+
+        # Flatten all advisories, deduplicate by advisory ID
+        rows: list[tuple[str, str, str, list[dict]]] = []  # (pkg_key, name, ver, [adv])
+        for pkg_key, advisories in vuln_matches.items():
+            parts = pkg_key.split(":", 2)
+            pkg_name = parts[1] if len(parts) > 1 else pkg_key
+            pkg_ver = parts[2] if len(parts) > 2 else ""
+            rows.append((pkg_key, pkg_name, pkg_ver, advisories))
+
+        total = sum(len(a) for _, _, _, a in rows)
+        host_name = host.display_name if host else ""
+        hdr.update(f"{host_name}  —  {total} vulnerabilities across {len(rows)} packages")
+
+        # Sort: packages with most vulns first
+        rows.sort(key=lambda r: len(r[3]), reverse=True)
+
+        try:
+            kev = _kev_ids_cached()
+        except Exception:
+            kev = frozenset()
+
+        seen_adv: set[str] = set()
+        for _, pkg_name, pkg_ver, advisories in rows:
+            for adv in advisories:
+                adv_id = adv.get("id", "")
+                if adv_id in seen_adv:
+                    continue
+                seen_adv.add(adv_id)
+
+                in_kev = "★" if adv_id in kev or any(a in kev for a in adv.get("aliases", [])) else ""
+                sev = adv.get("severity") or "Unknown"
+                cvss = adv.get("cvss_score")
+                cvss_str = f"{cvss:.1f}" if cvss is not None else ""
+                summary = (adv.get("summary") or "")[:80]
+
+                sev_style = {
+                    "Critical": "bold white on red",
+                    "High": "bold black on yellow",
+                    "Medium": "black on dark_orange3",
+                    "Low": "black on green",
+                }.get(sev.capitalize(), "")
+
+                tbl.add_row(
+                    adv_id,
+                    Text(in_kev, style="bold red") if in_kev else "",
+                    Text(sev, style=sev_style) if sev_style else sev,
+                    cvss_str,
+                    f"{pkg_name} {pkg_ver}".strip(),
+                    summary,
+                )
+
+
+def _kev_ids_cached() -> frozenset:
+    from ..vuln_db import kev_ids
+    return kev_ids()
