@@ -110,11 +110,11 @@ class HostListPanel(Widget):
         yield Label("Hosts", id="host-panel-title")
         yield ListView(id="host-list")
 
-    def update_hosts(self, result: ScanResult) -> None:
+    async def update_hosts(self, result: ScanResult) -> None:
         lv = self.query_one("#host-list", ListView)
-        lv.clear()
+        await lv.clear()
         for host in sorted(result.hosts.values(), key=lambda h: (-h.risk_score, h.ip)):
-            lv.append(HostListItem(host))
+            await lv.append(HostListItem(host))
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         item = event.item
@@ -208,9 +208,9 @@ class RemediationPanel(Widget):
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="remed-scroll")
 
-    def update_host(self, host: Host | None) -> None:
+    async def update_host(self, host: Host | None) -> None:
         scroll = self.query_one("#remed-scroll", VerticalScroll)
-        scroll.remove_children()
+        await scroll.remove_children()
         if host is None or not host.findings:
             scroll.mount(Label("No findings."))
             return

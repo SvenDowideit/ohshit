@@ -153,7 +153,7 @@ class OhShitApp(App[None]):
 
             result.scan_end = datetime.now()
             self.scan_result = result
-            self._refresh_all_panels()
+            await self._refresh_all_panels()
             self._set_progress("Scan complete", 100)
 
             net_label = result.network_risk_label.value.upper()
@@ -183,7 +183,7 @@ class OhShitApp(App[None]):
         host.findings = self._risk_engine.analyze(host, raw)
         _apply_os_release(host, raw)
 
-        self._refresh_right_panel(host)
+        await self._refresh_right_panel(host)
         self._log(f"[green]Done re-scanning {host.display_name}.[/green]")
 
     # ------------------------------------------------------------------
@@ -210,26 +210,26 @@ class OhShitApp(App[None]):
     # Panel refresh helpers
     # ------------------------------------------------------------------
 
-    def _refresh_all_panels(self) -> None:
+    async def _refresh_all_panels(self) -> None:
         if not self.scan_result:
             return
-        self.query_one("#host-panel", HostListPanel).update_hosts(self.scan_result)
+        await self.query_one("#host-panel", HostListPanel).update_hosts(self.scan_result)
         if self.selected_ip and self.selected_ip in self.scan_result.hosts:
-            self._refresh_right_panel(self.scan_result.hosts[self.selected_ip])
+            await self._refresh_right_panel(self.scan_result.hosts[self.selected_ip])
 
-    def _refresh_right_panel(self, host: Host) -> None:
+    async def _refresh_right_panel(self, host: Host) -> None:
         self.query_one("#host-detail", HostDetailTab).update_host(host)
         self.query_one("#findings-table", FindingsTable).update_host(host)
-        self.query_one("#remediation-panel", RemediationPanel).update_host(host)
+        await self.query_one("#remediation-panel", RemediationPanel).update_host(host)
 
     # ------------------------------------------------------------------
     # Message handlers
     # ------------------------------------------------------------------
 
-    def on_host_list_panel_host_selected(self, msg: HostListPanel.HostSelected) -> None:
+    async def on_host_list_panel_host_selected(self, msg: HostListPanel.HostSelected) -> None:
         self.selected_ip = msg.ip
         if self.scan_result and msg.ip in self.scan_result.hosts:
-            self._refresh_right_panel(self.scan_result.hosts[msg.ip])
+            await self._refresh_right_panel(self.scan_result.hosts[msg.ip])
 
     # ------------------------------------------------------------------
     # Reactive watchers
