@@ -126,6 +126,11 @@ _SCHEMA_STATEMENTS = [
     package_count INTEGER NOT NULL DEFAULT 0,
     is_latest     BOOLEAN NOT NULL DEFAULT TRUE
 )""",
+    """CREATE TABLE IF NOT EXISTS vuln_cache (
+    ip            TEXT PRIMARY KEY,
+    queried_at    TIMESTAMPTZ NOT NULL,
+    matches_json  TEXT NOT NULL DEFAULT '{}'
+)""",
 ]
 
 # Migrations: ALTER TABLE statements to add columns to existing DB files.
@@ -458,3 +463,33 @@ def load_scan_summary(con: duckdb.DuckDBPyConnection) -> dict[str, Any]:
 
 
 import uuid  # noqa: E402 (needed for start_scan_log above)
+
+
+# ---------------------------------------------------------------------------
+# Vuln cache helpers
+# ---------------------------------------------------------------------------
+
+def save_vuln_cache(con: duckdb.DuckDBPyConnection, ip: str, matches: dict) -> None:
+    """Persist vuln matches for a host into ohshit.db."""
+    con.execute(
+        """INSERT INTO vuln_cache (ip, queried_at, matches_json)
+           VALUES (?, ?, ?)
+           ON CONFLICT (ip) DO UPDATE SET
+               queried_at   = excluded.queried_at,
+               matches_json = excluded.matches_json""",
+        [ip, datetime.now(), json.dumps(matches)],
+    )
+
+
+def load_vuln_cache(con: duckdb.DuckDBPyConnection) -> dict[str, tuple[datetime, dict]]:
+    """Load all persisted vuln matches. Returns {ip: (queried_at, matches)}."""
+    rows = con.execute(
+        "SELECT ip, queried_at, matches_json FROM vuln_cache"
+    ).fetchall()
+    result: dict[str, tuple[datetime, dict]] = {}
+    for ip, queried_at, matches_json in rows:
+        try:
+            result[ip] = (queried_at, json.loads(matches_json or "{}"))
+        except Exception:
+            pass
+    return result

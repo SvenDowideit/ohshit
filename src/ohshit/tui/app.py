@@ -172,28 +172,103 @@ class OhShitApp(App[None]):
             self._thread_safe_log("[dim]OUI vendor database ready.[/dim]")
 
     def _refresh_vuln_cache_bg(self) -> None:
-        """Load previously-fetched vuln matches from the local cache into memory.
-        Runs in a background thread so it never blocks the UI."""
+        """Load persisted vuln matches from DB, apply to UI, then refresh any
+        stale entries (>24 h) by querying OSV in the background.
+        Runs in its own thread — never blocks the UI."""
+        import asyncio
+        import time
+        from datetime import timedelta
+        from ..vuln_db import query_vulns_for_packages, refresh_kev, kev_ids
+
+        _MAX_AGE = timedelta(hours=24)
+
+        # Wait briefly for _poll_db to populate _sbom_packages
+        time.sleep(0.5)
+
+        # ── Step 1: load what's already in ohshit.db ────────────────────
         try:
-            from ..vuln_db import match_packages_to_vulns, kev_ids
-            # Wait briefly for _poll_db to populate _sbom_packages first
-            import time
-            time.sleep(0.5)
+            reader = DB.open_reader(self._db_path)
+            cached = DB.load_vuln_cache(reader)
+            reader.close()
+        except Exception as exc:
+            self._thread_safe_log(f"[dim red]Vuln:[/dim red] Could not load vuln cache: {exc}")
+            cached = {}
+
+        kev = kev_ids()
+
+        loaded = 0
+        for ip, (queried_at, matches) in cached.items():
+            if matches:
+                self._vuln_matches[ip] = matches
+                self._apply_vuln_findings(ip, matches, kev)
+                loaded += 1
+
+        if loaded:
+            self._thread_safe_log(
+                f"[dim]Vuln:[/dim] Loaded cached vulnerability data for {loaded} host(s)"
+            )
+            DB.data_changed.set()
+
+        # ── Step 2: find hosts whose cache is stale or missing ──────────
+        now = datetime.now()
+        stale: list[str] = []
+        for ip, packages in list(self._sbom_packages.items()):
+            if not packages:
+                continue
+            entry = cached.get(ip)
+            if entry is None:
+                stale.append(ip)
+            else:
+                queried_at = entry[0]
+                age = now - (queried_at.replace(tzinfo=None) if queried_at.tzinfo else queried_at)
+                if age > _MAX_AGE:
+                    stale.append(ip)
+
+        if not stale:
+            return
+
+        self._thread_safe_log(
+            f"[dim]Vuln:[/dim] Refreshing vulnerability data for {len(stale)} host(s) "
+            f"(cache missing or >24 h old)…"
+        )
+
+        # ── Step 3: refresh KEV catalog once ────────────────────────────
+        try:
+            refresh_kev(log_cb=self._thread_safe_log)
             kev = kev_ids()
-            updated = 0
-            for ip, packages in list(self._sbom_packages.items()):
-                matches = match_packages_to_vulns(packages)
-                if matches:
+        except Exception as exc:
+            self._thread_safe_log(f"[dim red]Vuln:[/dim red] KEV refresh failed: {exc}")
+
+        # ── Step 4: query OSV for each stale host ───────────────────────
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            writer = DB.open_writer(self._db_path)
+            for ip in stale:
+                packages = self._sbom_packages.get(ip, [])
+                host = self._hosts.get(ip)
+                name = host.display_name if host else ip
+                if not packages:
+                    continue
+                try:
+                    matches = loop.run_until_complete(
+                        query_vulns_for_packages(packages, log_cb=self._thread_safe_log)
+                    )
+                    total = sum(len(v) for v in matches.values())
+                    self._thread_safe_log(
+                        f"[dim]Vuln:[/dim] {name} — {total} CVEs across {len(matches)} packages"
+                    )
                     self._vuln_matches[ip] = matches
                     self._apply_vuln_findings(ip, matches, kev)
-                    updated += 1
-            if updated:
-                self._thread_safe_log(
-                    f"[dim]Vuln:[/dim] Loaded cached vulnerability data for {updated} host(s)"
-                )
-                DB.data_changed.set()
-        except Exception:
-            pass
+                    DB.save_vuln_cache(writer, ip, matches)
+                    DB.data_changed.set()
+                except Exception as exc:
+                    self._thread_safe_log(
+                        f"[dim red]Vuln:[/dim red] {name} — query failed: {exc}"
+                    )
+            writer.close()
+        finally:
+            loop.close()
 
     def _apply_vuln_findings(
         self,
@@ -387,9 +462,12 @@ class OhShitApp(App[None]):
                     f"[dim]Vuln:[/dim] {host.display_name if host else ip} — "
                     f"{total} CVEs across {len(matches)} packages"
                 )
-                # Store in cache, update risk findings, refresh UI
+                # Persist, update risk findings, refresh UI
                 self._vuln_matches[ip] = matches
                 self._apply_vuln_findings(ip, matches, kev_ids())
+                writer = DB.open_writer(self._db_path)
+                DB.save_vuln_cache(writer, ip, matches)
+                writer.close()
                 DB.data_changed.set()
             except Exception as exc:
                 import traceback
