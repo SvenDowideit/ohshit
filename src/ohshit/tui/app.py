@@ -40,7 +40,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
-from textual.widgets import Footer, Header, Label, TabbedContent, TabPane
+from textual.widgets import Button, Footer, Header, Label, TabbedContent, TabPane
 
 from .. import db as DB
 from ..discovery import discover_all, tcp_port_scan
@@ -62,6 +62,7 @@ from .widgets import (
     HostDetailTab,
     HostListPanel,
     LogFeed,
+    NetworkSummaryPanel,
     RemediationPanel,
     SbomTab,
     ScanProgressBar,
@@ -89,6 +90,7 @@ class OhShitApp(App[None]):
 
     selected_ip: reactive[str | None] = reactive(None)
     scan_running: reactive[bool] = reactive(False)
+    showing_summary: reactive[bool] = reactive(False)
 
     def __init__(
         self,
@@ -124,7 +126,9 @@ class OhShitApp(App[None]):
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal(id="main-body"):
-            yield HostListPanel(id="host-panel")
+            with Vertical(id="left-panel"):
+                yield Button("Summary", id="summary-btn", variant="primary")
+                yield HostListPanel(id="host-panel")
             with Vertical(id="right-panel"):
                 with TabbedContent(id="detail-tabs", initial="tab-details"):
                     with TabPane("Host Details", id="tab-details"):
@@ -137,6 +141,7 @@ class OhShitApp(App[None]):
                         yield SbomTab(id="sbom-tab")
                     with TabPane("Vulnerabilities", id="tab-vulns"):
                         yield VulnTab(id="vuln-tab")
+                yield NetworkSummaryPanel(id="summary-panel")
         with Vertical(id="bottom-panel"):
             yield ScanProgressBar(id="scan-progress")
             yield LogFeed(id="log-feed")
@@ -303,6 +308,45 @@ class OhShitApp(App[None]):
                 self._reader.close()
             except Exception:
                 pass
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "summary-btn":
+            self.showing_summary = not self.showing_summary
+
+    def watch_showing_summary(self, showing: bool) -> None:
+        try:
+            tabs = self.query_one("#detail-tabs", TabbedContent)
+            summary = self.query_one("#summary-panel", NetworkSummaryPanel)
+            btn = self.query_one("#summary-btn", Button)
+            if showing:
+                tabs.display = False
+                summary.display = True
+                btn.label = "Host View"
+                self._refresh_summary_panel()
+            else:
+                tabs.display = True
+                summary.display = False
+                btn.label = "Summary"
+        except Exception:
+            pass
+
+    def _refresh_summary_panel(self) -> None:
+        """Populate the NetworkSummaryPanel with current data."""
+        try:
+            risk_history = DB.load_risk_history(self._reader) if self._reader else {}
+        except Exception:
+            risk_history = {}
+        # Flatten all vuln_matches into one dict keyed by ip
+        all_vuln_matches: dict[str, list[dict]] = {}
+        for ip, matches in self._vuln_matches.items():
+            for pkg, advs in matches.items():
+                for adv in advs:
+                    all_vuln_matches.setdefault(ip, []).append(adv)
+        self.query_one("#summary-panel", NetworkSummaryPanel).update(
+            self._hosts,
+            all_vuln_matches,
+            risk_history,
+        )
 
     # ------------------------------------------------------------------
     # DB poll (UI thread)
@@ -632,6 +676,13 @@ class OhShitApp(App[None]):
         self.scan_running = False
         self._set_progress("Scan complete", 100)
         self._poll_db()
+        # Record risk snapshot after scan completes (with up-to-date hosts)
+        try:
+            writer = DB.open_writer(self._db_path)
+            DB.save_risk_snapshot(writer, self._hosts)
+            writer.close()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Thread-safe UI callbacks (called from scanner thread)

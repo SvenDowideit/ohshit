@@ -131,6 +131,13 @@ _SCHEMA_STATEMENTS = [
     queried_at    TIMESTAMPTZ NOT NULL,
     matches_json  TEXT NOT NULL DEFAULT '{}'
 )""",
+    """CREATE TABLE IF NOT EXISTS risk_history (
+    recorded_at      TIMESTAMPTZ NOT NULL,
+    ip               TEXT NOT NULL,
+    risk_score       INTEGER NOT NULL,
+    network_score    INTEGER NOT NULL,
+    PRIMARY KEY (recorded_at, ip)
+)""",
 ]
 
 # Migrations: ALTER TABLE statements to add columns to existing DB files.
@@ -493,3 +500,66 @@ def load_vuln_cache(con: duckdb.DuckDBPyConnection) -> dict[str, tuple[datetime,
         except Exception:
             pass
     return result
+
+
+# ---------------------------------------------------------------------------
+# Risk history helpers
+# ---------------------------------------------------------------------------
+
+def save_risk_snapshot(
+    con: duckdb.DuckDBPyConnection,
+    hosts: "dict[str, Any]",
+) -> None:
+    """Record current risk scores for all hosts into risk_history.
+
+    Called once per completed scan so the summary panel can plot trends.
+    Skips hosts with score=0 that are Unreachable (no meaningful data).
+    """
+    from .models import ScanResult
+    if not hosts:
+        return
+    result = ScanResult(hosts=hosts)
+    network_score = result.network_risk_score
+    now = datetime.now()
+    for ip, host in hosts.items():
+        if host.state.value == "Unreachable" and host.risk_score == 0:
+            continue
+        try:
+            con.execute(
+                """INSERT INTO risk_history (recorded_at, ip, risk_score, network_score)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT (recorded_at, ip) DO NOTHING""",
+                [now, ip, host.risk_score, network_score],
+            )
+        except Exception:
+            pass
+
+
+def load_risk_history(
+    con: duckdb.DuckDBPyConnection,
+    months: int = 6,
+) -> dict[str, list[tuple[datetime, int]]]:
+    """Return per-host risk score history for the last N months.
+
+    Returns {ip: [(recorded_at, risk_score), ...]} sorted oldest-first.
+    Also includes a synthetic '__network__' key with network_score values.
+    """
+    rows = con.execute(
+        """SELECT ip, recorded_at, risk_score, network_score
+           FROM risk_history
+           WHERE recorded_at > NOW() - INTERVAL ? MONTH
+           ORDER BY recorded_at ASC""",
+        [months],
+    ).fetchall()
+
+    by_ip: dict[str, list[tuple[datetime, int]]] = {}
+    net: dict[datetime, int] = {}
+    for ip, recorded_at, risk_score, network_score in rows:
+        by_ip.setdefault(ip, []).append((recorded_at, risk_score))
+        # Use most recent network_score for each timestamp
+        net[recorded_at] = network_score
+
+    if net:
+        by_ip["__network__"] = sorted(net.items())
+
+    return by_ip

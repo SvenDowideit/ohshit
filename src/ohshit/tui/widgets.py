@@ -779,3 +779,199 @@ class VulnTab(Widget):
             )
 
 
+# ---------------------------------------------------------------------------
+# Network Summary Panel
+# ---------------------------------------------------------------------------
+
+_SPARK_CHARS = " ▁▂▃▄▅▆▇█"
+
+
+def _sparkline(values: list[int | float], width: int = 30) -> str:
+    """Return a unicode sparkline string of the given values."""
+    if not values:
+        return " " * width
+    mn = min(values)
+    mx = max(values)
+    span = mx - mn or 1
+    chars = []
+    for v in values[-width:]:
+        idx = int((v - mn) / span * (len(_SPARK_CHARS) - 1))
+        chars.append(_SPARK_CHARS[idx])
+    # Pad left if shorter than width
+    if len(chars) < width:
+        chars = [" "] * (width - len(chars)) + chars
+    return "".join(chars)
+
+
+class NetworkSummaryPanel(Widget):
+    """Full-panel summary: OS breakdown, state counts, top CVEs, risk sparklines."""
+
+    DEFAULT_CSS = """
+    NetworkSummaryPanel {
+        width: 1fr;
+        height: 1fr;
+        overflow-y: auto;
+    }
+    NetworkSummaryPanel .summary-header {
+        text-style: bold;
+        color: $accent;
+        padding: 0 1;
+    }
+    NetworkSummaryPanel .summary-section {
+        padding: 0 1 1 1;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Label("Network Summary", classes="summary-header")
+        yield VerticalScroll(
+            Static("", id="summary-body"),
+        )
+
+    def update(
+        self,
+        hosts: dict,
+        vuln_matches: dict | None = None,
+        risk_history: dict | None = None,
+    ) -> None:
+        self.post_message(self._UpdateMessage(hosts, vuln_matches or {}, risk_history or {}))
+
+    class _UpdateMessage(Message):
+        def __init__(
+            self,
+            hosts: dict,
+            vuln_matches: dict,
+            risk_history: dict,
+        ) -> None:
+            super().__init__()
+            self.hosts = hosts
+            self.vuln_matches = vuln_matches
+            self.risk_history = risk_history
+
+    def on_network_summary_panel__update_message(self, message: _UpdateMessage) -> None:
+        from textual import work
+        self._do_rebuild(message.hosts, message.vuln_matches, message.risk_history)
+
+    def _do_rebuild(
+        self,
+        hosts: dict,
+        vuln_matches: dict,
+        risk_history: dict,
+    ) -> None:
+        lines: list[str] = []
+
+        # ── OS / type breakdown ──────────────────────────────────────────────
+        os_counts: dict[str, int] = {}
+        for h in hosts.values():
+            key = h.os_guess or "Unknown"
+            # Shorten common long names
+            if "Ubuntu" in key:
+                key = "Ubuntu"
+            elif "Debian" in key:
+                key = "Debian"
+            elif "Raspberry" in key:
+                key = "Raspberry Pi OS"
+            elif "Windows" in key:
+                key = "Windows"
+            elif "Darwin" in key:
+                key = "macOS"
+            os_counts[key] = os_counts.get(key, 0) + 1
+
+        lines.append("── OS Distribution ─────────────────────────────────")
+        if os_counts:
+            total_hosts = len(hosts)
+            for os_name, count in sorted(os_counts.items(), key=lambda x: -x[1]):
+                bar_width = max(1, int(count / total_hosts * 30))
+                bar = "█" * bar_width
+                lines.append(f"  {os_name:<22} {bar} {count}")
+        else:
+            lines.append("  (no hosts)")
+
+        # ── Host state breakdown ─────────────────────────────────────────────
+        lines.append("")
+        lines.append("── Host States ──────────────────────────────────────")
+        state_counts: dict[str, int] = {}
+        for h in hosts.values():
+            s = h.state.value if hasattr(h.state, "value") else str(h.state)
+            state_counts[s] = state_counts.get(s, 0) + 1
+        for state, count in sorted(state_counts.items(), key=lambda x: -x[1]):
+            lines.append(f"  {state:<20} {count}")
+
+        # ── Top CVEs ─────────────────────────────────────────────────────────
+        lines.append("")
+        lines.append("── Top Vulnerabilities (by host count) ─────────────")
+        cve_hosts: dict[str, set[str]] = {}
+        cve_meta: dict[str, dict] = {}
+        for ip, matches in vuln_matches.items():
+            for adv in matches:
+                adv_id = adv.get("id", "")
+                if not adv_id:
+                    continue
+                if adv_id not in cve_hosts:
+                    cve_hosts[adv_id] = set()
+                    cve_meta[adv_id] = adv
+                cve_hosts[adv_id].add(ip)
+
+        # Sort by: KEV first, then ransomware, then EPSS, then host count
+        def _cve_sort(item: tuple) -> tuple:
+            adv_id, host_set = item
+            meta = cve_meta.get(adv_id, {})
+            in_kev = meta.get("source") == "kev"
+            ransomware = bool(meta.get("ransomware"))
+            epss = meta.get("epss_score") or 0.0
+            return (0 if in_kev else 1, 0 if ransomware else 1, -epss, -len(host_set))
+
+        top_cves = sorted(cve_hosts.items(), key=_cve_sort)[:20]
+        if top_cves:
+            lines.append(f"  {'ID':<28} {'Hosts':>5}  {'Sev':<8}  Flags")
+            lines.append(f"  {'─'*28} {'─'*5}  {'─'*8}  {'─'*10}")
+            for adv_id, host_set in top_cves:
+                meta = cve_meta.get(adv_id, {})
+                sev = (meta.get("severity") or "").capitalize()[:8]
+                in_kev = meta.get("source") == "kev"
+                ransomware = bool(meta.get("ransomware"))
+                epss = meta.get("epss_score")
+                flags = []
+                if in_kev:
+                    flags.append("★KEV")
+                if ransomware:
+                    flags.append("R")
+                if epss is not None:
+                    flags.append(f"EPSS:{epss*100:.0f}%")
+                flags_str = " ".join(flags)
+                lines.append(f"  {adv_id:<28} {len(host_set):>5}  {sev:<8}  {flags_str}")
+        else:
+            lines.append("  (no vulnerabilities found)")
+
+        # ── Per-host risk sparklines ─────────────────────────────────────────
+        lines.append("")
+        lines.append("── Per-host Risk Trend (6 months) ──────────────────")
+        net_history = risk_history.get("__network__", [])
+        host_history_items = [(ip, v) for ip, v in risk_history.items() if ip != "__network__"]
+
+        if host_history_items:
+            for ip, history in sorted(host_history_items, key=lambda x: x[0]):
+                host = hosts.get(ip)
+                name = host.display_name if host else ip
+                scores = [s for _, s in history]
+                spark = _sparkline(scores, width=20)
+                current = scores[-1] if scores else 0
+                lines.append(f"  {name:<22} {spark}  {current:>4}")
+        else:
+            lines.append("  (no history yet — run a scan to populate)")
+
+        # ── Network risk trend ───────────────────────────────────────────────
+        lines.append("")
+        lines.append("── Network Risk Trend ───────────────────────────────")
+        if net_history:
+            net_scores = [s for _, s in net_history]
+            spark = _sparkline(net_scores, width=40)
+            current_net = net_scores[-1] if net_scores else 0
+            lines.append(f"  {spark}  current: {current_net}")
+        else:
+            lines.append("  (no history yet)")
+
+        # Write to the static body widget
+        body = self.query_one("#summary-body", Static)
+        body.update("\n".join(lines))
+
