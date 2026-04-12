@@ -159,8 +159,8 @@ async def _ping_one(ip: str, sem: asyncio.Semaphore) -> str | None:
 async def ping_sweep(cidr: str, timeout: float = 1.5) -> list[str]:
     """Return list of live IPs in the subnet via ICMP ping."""
     network = ipaddress.ip_network(cidr, strict=False)
-    hosts = list(network.hosts())[:254]
-    sem = asyncio.Semaphore(50)
+    hosts = list(network.hosts())
+    sem = asyncio.Semaphore(256)
     tasks = [_ping_one(h, sem) for h in hosts]
     results = await asyncio.gather(*tasks)
     return [ip for ip in results if ip is not None]
@@ -312,7 +312,8 @@ async def discover_all(
 
     prog(f"ARP table: {len(hosts)} hosts", 12)
 
-    prog("Running ping sweep...", 15)
+    total_hosts = ipaddress.ip_network(cidr, strict=False).num_addresses - 2
+    prog(f"Running ping sweep ({total_hosts} addresses)...", 15)
     live_ips = await ping_sweep(cidr)
     for ip in live_ips:
         if ip not in hosts:
