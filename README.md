@@ -76,10 +76,15 @@ make clean        Remove .venv and cache directories
 The subnet and gateway are detected automatically from `ip route`. Override
 with `--subnet 192.168.1.0/24` if needed.
 
-### 2 — SSH collection
+### 2 — SSH collection (and local shell)
 
-For each reachable host, the tool connects with your existing SSH key or agent
-(`SSH_AUTH_SOCK`) and runs read-only commands concurrently:
+The tool detects which IP addresses belong to the machine it is running on by
+inspecting `ip addr`. For the local machine it runs the same commands directly
+via shell subprocesses instead of SSH — so it works even when `sshd` is not
+installed or not running. The host is labelled **Local** in the host list.
+
+For all other reachable hosts, the tool connects with your existing SSH key or
+agent (`SSH_AUTH_SOCK`) and runs read-only commands concurrently:
 
 - OS and kernel version
 - Running systemd services
@@ -92,8 +97,8 @@ For each reachable host, the tool connects with your existing SSH key or agent
 - Shadow file readability
 - Package inventory for SBOM (see below)
 
-Up to 5 hosts are collected in parallel. Hosts that are unreachable or reject
-the key are marked **SSH Failed** and shown without findings.
+Up to 5 remote hosts are collected in parallel. Hosts that are unreachable or
+reject the key are marked **SSH Failed** and shown without findings.
 
 > **Note:** SSH host-key verification is disabled by default so newly
 > re-imaged LAN devices don't block scans. Enable strict checking with
@@ -258,18 +263,24 @@ separately in `~/.cache/ohshit/vuln.duckdb`, shared across all projects.
 
 The Textual TUI refreshes as data arrives:
 
-- **Left panel** — host list sorted by risk score, with coloured severity badges
+- **Left panel** — host list sorted by risk score, with coloured severity badges.
+  The machine running oh-shit is labelled **Local** instead of SSH OK/Failed.
 - **Right panel (tabbed)**
-  - *Host Details* — IP, MAC, OS, kernel, vendor, IoT identifiers, open ports
+  - *Host Details* — IP, MAC, OS, kernel, vendor, IoT identifiers, CVE summary
+    (total count, severity breakdown, KEV/ransomware indicators), and open ports
   - *Findings* — table of all findings sorted by severity
   - *Remediation* — copy-pasteable fix commands for each finding
-  - *SBOM* — package inventory for the selected host. First column shows CVE
-    count (red if non-zero). Sorted by: KEV hits → worst CVE severity → CVE
-    count → newest release date. Header shows collection timestamp, package
+  - *SBOM* — package inventory for the selected host. First two columns are
+    `Risk` (coloured badge: `★KEV` / `CRIT` / `HIGH` / `MED` / `LOW`) and
+    `CVEs` (count, red if non-zero). Sorted by: KEV hits → worst CVE severity →
+    CVE count → newest release date. Header shows collection timestamp, package
     count, and total CVE count.
-  - *Vulnerabilities* — CVE advisory list for the selected host's packages,
-    with KEV active-exploitation badge (★), severity, CVSS score, and summary
-- **Bottom** — scan progress bar and live log
+  - *Vulnerabilities* — CVE advisory list sorted by exploitation risk: KEV
+    (confirmed active exploitation, `★`) first, then ransomware-linked (`R`),
+    then highest EPSS probability, then severity, then CVSS score. Columns:
+    advisory ID, `Exploit` badge, Severity, CVSS, EPSS%, affected package,
+    summary. EPSS% is highlighted yellow when ≥ 10%.
+- **Bottom** — scan progress bar (shows vuln fetch progress too) and live log
 
 #### Keyboard shortcuts
 
@@ -277,8 +288,9 @@ The Textual TUI refreshes as data arrives:
 |-----|--------|
 | `r` | Re-scan all hosts |
 | `s` | Re-scan the selected host |
-| `b` | Collect SBOM for the selected host only (SSH only, no full rescan; bypasses 24 h age check) |
-| `v` | Force vulnerability refresh for the selected host (OSV + CISA KEV) |
+| `b` | Collect SBOM for the selected host only (local shell or SSH; bypasses 24 h age check) |
+| `v` | Show vulnerability data for the selected host — reads from local cache instantly; only fetches from OSV if no cache exists yet |
+| `V` | Force-download fresh KEV + OSV data for **all** hosts with an SBOM, then update every host's risk score |
 | `e` | Export Markdown report to `~/network-security-report-<timestamp>.md` |
 | `q` | Quit |
 
@@ -309,7 +321,8 @@ and are never automatically removed.
 
 Per-host vulnerability matches are stored in `ohshit.db` (`vuln_cache` table)
 and loaded on every startup. Stale entries (>24 h) are refreshed automatically
-in the background.
+in the background. Pressing `v` reads from this cache instantly with no network
+access; pressing `V` forces a full re-download for all hosts.
 
 Raw advisory data (CVE details, CVSS scores) is cached in
 `~/.cache/ohshit/vuln.duckdb`, shared across all projects and runs.
@@ -320,7 +333,7 @@ Raw advisory data (CVE details, CVSS scores) is cached in
 src/ohshit/
   models.py          Dataclasses: Host, Finding, PortInfo, IotInfo, ScanResult, enums
   discovery.py       ARP / ping sweep / nmap / router ARP
-  ssh_collector.py   asyncssh remote command collection + SBOM command definitions
+  ssh_collector.py   SSH + local-shell collection; auto-detects local machine IPs
   risk_engine.py     Scoring rules → Finding objects
   sbom.py            SBOM collection, parsing, per-host DuckDB storage, DuckLake catalog
   vuln_db.py         Vulnerability cache — OSV + CISA KEV, local DuckDB at ~/.cache/ohshit/vuln.duckdb
@@ -372,8 +385,9 @@ which the UI thread reads without locking.
   (open ports, package versions, account names). Treat it accordingly.
 - SBOM databases stored in `sbom/` contain full package inventories for each
   host. Restrict access to this directory appropriately.
-- Vulnerability queries are sent to `api.osv.dev` (Google) and
-  `www.cisa.gov` — the package names and versions of every installed package
-  on your hosts are transmitted. This happens automatically in the background
-  for any host with a stale or missing vuln cache. Do not run on air-gapped
-  networks or where package inventory must remain confidential.
+- Vulnerability queries are sent to `api.osv.dev` (Google), `www.cisa.gov`,
+  and `api.first.org` (EPSS) — the package names and versions of every
+  installed package on your hosts are transmitted. This happens automatically
+  in the background for any host with a stale or missing vuln cache, and on
+  demand when `V` is pressed. Do not run on air-gapped networks or where
+  package inventory must remain confidential.
