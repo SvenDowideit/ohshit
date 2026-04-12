@@ -24,12 +24,47 @@ Screen {
     padding: 0 1;
 }
 
+/* Right panel must fill its vertical space so TabbedContent can too */
 #right-panel {
     width: 1fr;
+    height: 100%;
+}
+
+/* TabbedContent defaults to height:auto — override so it fills the panel */
+#detail-tabs {
+    height: 100%;
+}
+
+/* TabPane must also fill so inner widgets get a real height */
+TabPane {
+    height: 100%;
+    padding: 0;
+}
+
+/* Inner widgets fill their TabPane */
+HostDetailTab {
+    height: 100%;
+    overflow-y: scroll;
+}
+
+FindingsTable {
+    height: 100%;
+}
+
+FindingsTable > DataTable {
+    height: 100%;
+}
+
+RemediationPanel {
+    height: 100%;
+}
+
+RemediationPanel > VerticalScroll {
+    height: 100%;
 }
 
 #bottom-panel {
-    height: 9;
+    height: 12;
     border-top: solid $primary;
     layout: vertical;
 }
@@ -40,7 +75,7 @@ Screen {
 }
 
 #log-feed {
-    height: 6;
+    height: 9;
     padding: 0 1;
 }
 
@@ -87,6 +122,10 @@ HostListItem > Horizontal {
 #ports-label {
     padding: 1 1 0 1;
     text-style: bold;
+}
+
+#ports-table {
+    height: 1fr;
 }
 
 /* Remediation panel */

@@ -134,6 +134,11 @@ class OhShitApp(App[None]):
             )
 
             self._log(f"Discovery done: {len(result.hosts)} hosts found.")
+
+            if self._no_ssh:
+                self._log("[dim]SSH collection skipped (--no-ssh)[/dim]")
+            else:
+                self._log(f"Starting SSH collection on {len(result.hosts)} hosts...")
             self._set_progress("SSH collection...", 0)
 
             raw = await collect_all(
