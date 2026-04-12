@@ -30,52 +30,84 @@ ProgressCallback = Callable[[str, int], None]
 
 
 async def detect_local_subnet() -> tuple[str, str]:
-    """Return (cidr, gateway_ip) from ip route output."""
+    """Return (cidr, gateway_ip) using the interface that carries the default route.
+
+    Strategy:
+    1. Parse `ip route` to find the default gateway AND the interface it uses.
+    2. Parse `ip addr show <iface>` to get the exact CIDR for that interface.
+    3. Skip interfaces that are DOWN or carry only link-local / loopback addresses.
+    This avoids picking up Docker bridge networks or other virtual adapters.
+    """
     proc = await asyncio.create_subprocess_exec(
         "ip", "route",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
     )
     stdout, _ = await proc.communicate()
-    text = stdout.decode()
+    route_text = stdout.decode()
 
     gateway = None
-    cidr = None
-    for line in text.splitlines():
-        m = re.match(r"default via (\S+)", line)
+    gw_iface = None
+    for line in route_text.splitlines():
+        # e.g. "default via 10.10.10.1 dev wlp0s20f3 proto dhcp ..."
+        m = re.match(r"default via (\S+) dev (\S+)", line)
         if m:
             gateway = m.group(1)
-        m = re.match(r"(\d+\.\d+\.\d+\.\d+/\d+) dev", line)
-        if m and not line.startswith("default"):
-            cidr = m.group(1)
+            gw_iface = m.group(2)
+            break
+
+    cidr = None
+    if gw_iface:
+        # Ask for just that interface's addresses
+        proc2 = await asyncio.create_subprocess_exec(
+            "ip", "addr", "show", gw_iface,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout2, _ = await proc2.communicate()
+        for line in stdout2.decode().splitlines():
+            # e.g. "    inet 10.10.13.208/20 brd 10.10.15.255 scope global ..."
+            m = re.search(r"inet (\d+\.\d+\.\d+\.\d+/\d+).*scope global", line)
+            if m:
+                # Convert host address + prefix to network CIDR
+                net = ipaddress.ip_interface(m.group(1)).network
+                cidr = str(net)
+                break
 
     if not gateway or not cidr:
-        # Fallback: parse /proc/net/route
+        # Fallback: /proc/net/route — pick the non-default route on the same
+        # interface as the default gateway, skipping linkdown bridges.
         try:
             async with aiofiles.open("/proc/net/route") as f:
                 lines = await f.readlines()
+            gw_iface_proc = None
+            routes: list[tuple[str, str, str, str]] = []  # (iface, dest, gw, mask)
             for line in lines[1:]:
                 parts = line.split()
-                if len(parts) < 9:
+                if len(parts) < 8:
                     continue
-                dest_hex = parts[1]
-                gw_hex = parts[2]
-                mask_hex = parts[7]
+                iface = parts[0]
+                dest_hex, gw_hex, mask_hex = parts[1], parts[2], parts[7]
                 dest = socket.inet_ntoa(struct.pack("<I", int(dest_hex, 16)))
-                mask = socket.inet_ntoa(struct.pack("<I", int(mask_hex, 16)))
-                gw = socket.inet_ntoa(struct.pack("<I", int(gw_hex, 16)))
+                gw   = socket.inet_ntoa(struct.pack("<I", int(gw_hex, 16)))
                 if dest_hex == "00000000":
-                    gateway = gw
-                elif gw_hex == "00000000" and mask_hex != "00000000":
+                    if not gateway:
+                        gateway = gw
+                    gw_iface_proc = iface
+                else:
+                    routes.append((iface, dest, gw_hex, mask_hex))
+            # Now find the subnet route on the same interface as the default gw
+            for iface, dest, gw_hex, mask_hex in routes:
+                if iface == gw_iface_proc and gw_hex == "00000000" and mask_hex != "00000000":
                     prefix = bin(int(mask_hex, 16)).count("1")
                     cidr = f"{dest}/{prefix}"
+                    break
         except OSError:
             pass
 
     if not gateway:
         raise DiscoveryError("Could not detect default gateway")
     if not cidr:
-        # Derive /24 from gateway
         parts = gateway.rsplit(".", 1)
         cidr = f"{parts[0]}.0/24"
 
