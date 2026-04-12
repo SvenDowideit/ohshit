@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +40,7 @@ class SbomPackage:
     source: str          # "dpkg", "rpm", "snap", "flatpak", "pip", "docker"
     package_type: str    # "deb", "rpm", "snap", "flatpak", "python", "container"
     arch: str = ""
+    installed_at: datetime | None = None
 
 
 _SBOM_SCHEMA = [
@@ -49,6 +50,7 @@ _SBOM_SCHEMA = [
         source       TEXT NOT NULL,
         package_type TEXT NOT NULL,
         arch         TEXT NOT NULL DEFAULT '',
+        installed_at TIMESTAMPTZ,
         PRIMARY KEY (name, source)
     )""",
     """CREATE TABLE IF NOT EXISTS metadata (
@@ -105,9 +107,9 @@ def write_sbom(
     con.execute("DELETE FROM packages")
     for pkg in packages:
         con.execute(
-            "INSERT INTO packages (name, version, source, package_type, arch) "
-            "VALUES (?, ?, ?, ?, ?)",
-            [pkg.name, pkg.version, pkg.source, pkg.package_type, pkg.arch],
+            "INSERT INTO packages (name, version, source, package_type, arch, installed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [pkg.name, pkg.version, pkg.source, pkg.package_type, pkg.arch, pkg.installed_at],
         )
 
     # Store collection metadata
@@ -148,34 +150,94 @@ def should_collect_sbom(base_dir: Path, host_id: str, max_age_hours: float = 24.
 # Parsing functions — convert raw SSH output into SbomPackage lists
 # ---------------------------------------------------------------------------
 
-def parse_dpkg(raw: str) -> list[SbomPackage]:
+def _parse_dpkg_dates(raw: str) -> dict[str, datetime]:
+    """Parse `stat -c '%n\t%Y' /var/lib/dpkg/info/*.list` output.
+
+    Returns a dict of package_name -> install datetime.
+    Filenames are like /var/lib/dpkg/info/bash.list or bash:amd64.list.
+    """
+    dates: dict[str, datetime] = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or "\t" not in line:
+            continue
+        path, _, ts_str = line.rpartition("\t")
+        try:
+            ts = int(ts_str)
+        except ValueError:
+            continue
+        # Extract package name from path: /var/lib/dpkg/info/bash:amd64.list -> bash
+        name = path.rsplit("/", 1)[-1]
+        name = name.removesuffix(".list")
+        name = name.split(":")[0]  # strip :arch suffix
+        dates[name] = datetime.fromtimestamp(ts, tz=timezone.utc)
+    return dates
+
+
+def _parse_pip_dates(raw: str) -> dict[str, datetime]:
+    """Parse `stat -c '%n\t%Y' .../*.dist-info/METADATA` output.
+
+    Returns a dict of package_name -> install datetime.
+    Paths like /usr/lib/python3/dist-packages/requests-2.31.0.dist-info/METADATA
+    """
+    dates: dict[str, datetime] = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or "\t" not in line:
+            continue
+        path, _, ts_str = line.rpartition("\t")
+        try:
+            ts = int(float(ts_str))
+        except ValueError:
+            continue
+        # Extract package name: requests-2.31.0.dist-info -> requests
+        dirname = path.rsplit("/", 1)[-1]  # requests-2.31.0.dist-info
+        dist_name = dirname.removesuffix(".dist-info")
+        # dist_name is like "requests-2.31.0" or "Pillow-10.0.0"
+        # Strip version (everything from the last hyphen that precedes a digit)
+        name = re.sub(r"-\d.*$", "", dist_name).lower().replace("-", "_")
+        if name:
+            dates[name] = datetime.fromtimestamp(ts, tz=timezone.utc)
+    return dates
+
+
+def parse_dpkg(raw: str, dates: dict[str, datetime] | None = None) -> list[SbomPackage]:
     """Parse dpkg-query -W output: name\tversion\tarch per line."""
     pkgs = []
     for line in raw.splitlines():
         parts = line.strip().split("\t")
         if len(parts) >= 2 and parts[0] and parts[1]:
+            name = parts[0]
             pkgs.append(SbomPackage(
-                name=parts[0],
+                name=name,
                 version=parts[1],
                 source="dpkg",
                 package_type="deb",
                 arch=parts[2] if len(parts) >= 3 else "",
+                installed_at=dates.get(name) if dates else None,
             ))
     return pkgs
 
 
 def parse_rpm(raw: str) -> list[SbomPackage]:
-    """Parse rpm -qa output: name\tversion-release\tarch per line."""
+    """Parse rpm -qa output: name\tversion-release\tarch\tinstall_unix_ts per line."""
     pkgs = []
     for line in raw.splitlines():
         parts = line.strip().split("\t")
         if len(parts) >= 2 and parts[0] and parts[1]:
+            installed_at = None
+            if len(parts) >= 4 and parts[3].isdigit():
+                try:
+                    installed_at = datetime.fromtimestamp(int(parts[3]), tz=timezone.utc)
+                except (ValueError, OSError):
+                    pass
             pkgs.append(SbomPackage(
                 name=parts[0],
                 version=parts[1],
                 source="rpm",
                 package_type="rpm",
                 arch=parts[2] if len(parts) >= 3 else "",
+                installed_at=installed_at,
             ))
     return pkgs
 
@@ -217,7 +279,7 @@ def parse_flatpak(raw: str) -> list[SbomPackage]:
     return pkgs
 
 
-def parse_pip_freeze(raw: str) -> list[SbomPackage]:
+def parse_pip_freeze(raw: str, dates: dict[str, datetime] | None = None) -> list[SbomPackage]:
     """Parse pip freeze output: name==version."""
     pkgs = []
     for line in raw.splitlines():
@@ -226,11 +288,14 @@ def parse_pip_freeze(raw: str) -> list[SbomPackage]:
             continue
         if "==" in line:
             name, _, version = line.partition("==")
+            name = name.strip()
+            norm = name.lower().replace("-", "_")
             pkgs.append(SbomPackage(
                 name=name.strip(),
                 version=version.strip(),
                 source="pip",
                 package_type="python",
+                installed_at=dates.get(norm) if dates else None,
             ))
     return pkgs
 
@@ -272,8 +337,11 @@ def collect_packages_from_raw(raw: dict[str, Any]) -> list[SbomPackage]:
                 seen.add(key)
                 all_pkgs.append(p)
 
+    dpkg_dates = _parse_dpkg_dates(raw.get("sbom_dpkg_dates", ""))
+    pip_dates = _parse_pip_dates(raw.get("sbom_pip_dates", ""))
+
     if raw.get("sbom_dpkg"):
-        add_unique(parse_dpkg(raw["sbom_dpkg"]))
+        add_unique(parse_dpkg(raw["sbom_dpkg"], dpkg_dates))
     if raw.get("sbom_rpm"):
         add_unique(parse_rpm(raw["sbom_rpm"]))
     if raw.get("sbom_snap"):
@@ -281,9 +349,9 @@ def collect_packages_from_raw(raw: dict[str, Any]) -> list[SbomPackage]:
     if raw.get("sbom_flatpak"):
         add_unique(parse_flatpak(raw["sbom_flatpak"]))
     if raw.get("sbom_pip"):
-        add_unique(parse_pip_freeze(raw["sbom_pip"]))
+        add_unique(parse_pip_freeze(raw["sbom_pip"], pip_dates))
     if raw.get("sbom_pip_user"):
-        add_unique(parse_pip_freeze(raw["sbom_pip_user"]))
+        add_unique(parse_pip_freeze(raw["sbom_pip_user"], pip_dates))
     if raw.get("docker_images"):
         add_unique(parse_docker_images(raw["docker_images"]))
 
@@ -357,10 +425,10 @@ def load_latest_packages(
         try:
             hcon = duckdb.connect(str(db), read_only=True)
             pkgs = hcon.execute(
-                "SELECT name, version, source, package_type, arch FROM packages ORDER BY source, name"
+                "SELECT name, version, source, package_type, arch, installed_at FROM packages ORDER BY source, name"
             ).fetchall()
             hcon.close()
-            for name, version, source, package_type, arch in pkgs:
+            for name, version, source, package_type, arch, installed_at in pkgs:
                 results.append({
                     "host_id": host_id,
                     "ip": row_ip,
@@ -371,6 +439,7 @@ def load_latest_packages(
                     "source": source,
                     "package_type": package_type,
                     "arch": arch,
+                    "installed_at": installed_at,
                 })
         except Exception:
             pass

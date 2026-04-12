@@ -188,11 +188,14 @@ class HostListPanel(Widget):
                 item = items_by_ip[ip]
                 # Re-query live children each iteration since moves change positions
                 current_children = list(lv.query(HostListItem))
+                if item not in current_children:
+                    # Item was moved earlier in this loop and is mid-flight; skip —
+                    # the next poll will converge the order.
+                    continue
                 current_idx = current_children.index(item)
                 if current_idx != target_idx:
                     await item.remove()
                     if target_idx == 0:
-                        # Find the new first child after removal
                         remaining = list(lv.query(HostListItem))
                         if remaining:
                             await lv.mount(items_by_ip[ip], before=remaining[0])
@@ -474,7 +477,7 @@ class SbomTab(Widget):
 
     def on_mount(self) -> None:
         tbl = self.query_one("#sbom-table", DataTable)
-        tbl.add_columns("Source", "Name", "Version", "Type", "Arch")
+        tbl.add_columns("Installed", "Source", "Name", "Version", "Arch")
         tbl.cursor_type = "row"
 
     def update_sbom(self, packages: list[dict], host: "Host | None" = None) -> None:
@@ -496,11 +499,30 @@ class SbomTab(Widget):
         host_name = packages[0].get("hostname") or packages[0].get("ip", "")
         hdr.update(f"{host_name}  —  {count} packages  (collected {ts_str})")
 
-        for pkg in sorted(packages, key=lambda p: (p.get("source", ""), p.get("name", ""))):
+        now = datetime.now(timezone.utc)
+
+        def _sort_key(p: dict):
+            ia = p.get("installed_at")
+            # Packages with no date sort to the end (oldest-looking)
+            if ia is None:
+                return datetime.min.replace(tzinfo=timezone.utc)
+            if ia.tzinfo is None:
+                ia = ia.replace(tzinfo=timezone.utc)
+            return ia
+
+        for pkg in sorted(packages, key=_sort_key, reverse=True):
+            ia = pkg.get("installed_at")
+            if ia is None:
+                age_str = "unknown"
+            else:
+                if ia.tzinfo is None:
+                    ia = ia.replace(tzinfo=timezone.utc)
+                age_str = _ago(ia)
+
             tbl.add_row(
+                age_str,
                 pkg.get("source", ""),
                 pkg.get("name", ""),
                 pkg.get("version", ""),
-                pkg.get("package_type", ""),
                 pkg.get("arch", ""),
             )
