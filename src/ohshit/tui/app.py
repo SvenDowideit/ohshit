@@ -46,6 +46,7 @@ from .. import db as DB
 from ..discovery import discover_all, tcp_port_scan
 from ..iot import detect_iot, passive_network_scan
 from ..models import Host, IotInfo, ScanResult, Severity
+from ..port_probe import probe_ports
 from ..report import generate_markdown_report
 from ..risk_engine import RiskEngine
 from ..ssh_collector import collect_all, _apply_os_release
@@ -453,6 +454,13 @@ async def _scanner_async(
                 scanned = await tcp_port_scan(host.ip)
                 if scanned:
                     host.open_ports = scanned
+
+        # Deep-probe open ports to fill in version strings and refine identity.
+        # For non-SSH hosts this is our only source of version info.
+        # For SSH hosts ss already gives process names, but we still probe
+        # any ports ss didn't label (version == "").
+        if host.open_ports:
+            await probe_ports(host)
 
         # Risk analysis
         host.findings = risk_engine.analyze(host, raw)
