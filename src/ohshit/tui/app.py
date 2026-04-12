@@ -169,15 +169,17 @@ class OhShitApp(App[None]):
         """Load previously-fetched vuln matches from the local cache into memory.
         Runs in a background thread so it never blocks the UI."""
         try:
-            from ..vuln_db import match_packages_to_vulns
+            from ..vuln_db import match_packages_to_vulns, kev_ids
             # Wait briefly for _poll_db to populate _sbom_packages first
             import time
             time.sleep(0.5)
+            kev = kev_ids()
             updated = 0
             for ip, packages in list(self._sbom_packages.items()):
                 matches = match_packages_to_vulns(packages)
                 if matches:
                     self._vuln_matches[ip] = matches
+                    self._apply_vuln_findings(ip, matches, kev)
                     updated += 1
             if updated:
                 self._thread_safe_log(
@@ -186,6 +188,22 @@ class OhShitApp(App[None]):
                 DB.data_changed.set()
         except Exception:
             pass
+
+    def _apply_vuln_findings(
+        self,
+        ip: str,
+        vuln_matches: dict[str, list[dict]],
+        kev: frozenset[str],
+    ) -> None:
+        """Merge vuln-derived findings into the in-memory host object."""
+        host = self._hosts.get(ip)
+        if host is None:
+            return
+        # Remove any previously generated vuln findings, then re-add
+        host.findings = [f for f in host.findings if f.category != "vulnerabilities"]
+        new_findings = self._risk_engine.analyze_vulns(host, vuln_matches, kev)
+        host.findings.extend(new_findings)
+        host.findings.sort(key=lambda f: f.score, reverse=True)
 
     def on_unmount(self) -> None:
         if self._reader:
@@ -351,7 +369,7 @@ class OhShitApp(App[None]):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                from ..vuln_db import query_vulns_for_packages, refresh_kev
+                from ..vuln_db import query_vulns_for_packages, refresh_kev, kev_ids
                 # Refresh KEV catalog first (fast, ~200 KB)
                 refresh_kev(log_cb=self._thread_safe_log)
                 # Then query OSV for this host's packages
@@ -363,8 +381,9 @@ class OhShitApp(App[None]):
                     f"[dim]Vuln:[/dim] {host.display_name if host else ip} — "
                     f"{total} CVEs across {len(matches)} packages"
                 )
-                # Store in cache and refresh UI
+                # Store in cache, update risk findings, refresh UI
                 self._vuln_matches[ip] = matches
+                self._apply_vuln_findings(ip, matches, kev_ids())
                 DB.data_changed.set()
             except Exception as exc:
                 import traceback

@@ -329,3 +329,130 @@ class RiskEngine:
             except Exception:
                 pass  # never let a bad rule crash the scan
         return sorted(findings, key=lambda f: f.score, reverse=True)
+
+    def analyze_vulns(
+        self,
+        host: Host,
+        vuln_matches: dict[str, list[dict]],
+        kev_ids: frozenset[str],
+    ) -> list[Finding]:
+        """Generate findings from CVE/advisory data for this host.
+
+        vuln_matches: {source:name:version: [advisory_dict, ...]}
+        kev_ids: set of CVE IDs in the CISA Known Exploited Vulnerabilities catalog
+
+        Scoring:
+          - Any package with a KEV hit                → Critical (score 10) per finding
+          - 50+ total CVEs on host                   → Critical (score 10)
+          - 21–49 total CVEs                         → High (score 5)
+          - 6–20 total CVEs                          → Medium (score 2)
+          - 1–5 total CVEs                           → Low (score 1)
+          - High/Critical severity CVEs              → additional High finding
+        """
+        if not vuln_matches:
+            return []
+
+        findings: list[Finding] = []
+
+        # Flatten all unique advisories
+        seen_ids: set[str] = set()
+        all_advisories: list[dict] = []
+        kev_hits: list[tuple[str, str]] = []  # (pkg_key, advisory_id)
+        high_crit_hits: list[tuple[str, str]] = []  # (pkg_key, advisory_id)
+
+        for pkg_key, advisories in vuln_matches.items():
+            for adv in advisories:
+                adv_id = adv.get("id", "")
+                if not adv_id or adv_id in seen_ids:
+                    continue
+                seen_ids.add(adv_id)
+                all_advisories.append(adv)
+
+                aliases = adv.get("aliases", [])
+                in_kev = adv_id in kev_ids or any(a in kev_ids for a in aliases)
+                if in_kev:
+                    kev_hits.append((pkg_key, adv_id))
+
+                sev = (adv.get("severity") or "").lower()
+                if sev in ("critical", "high"):
+                    high_crit_hits.append((pkg_key, adv_id))
+
+        total = len(all_advisories)
+        if total == 0:
+            return []
+
+        # --- KEV finding (one per host, most severe) ---
+        if kev_hits:
+            kev_pkg_names = sorted({k.split(":")[1] for k, _ in kev_hits})[:5]
+            kev_ids_list = [adv_id for _, adv_id in kev_hits[:5]]
+            findings.append(Finding(
+                host_ip=host.ip,
+                category="vulnerabilities",
+                severity=Severity.CRITICAL,
+                title=f"{len(kev_hits)} actively-exploited CVE(s) (CISA KEV) in installed packages",
+                description=(
+                    f"{len(kev_hits)} installed package(s) have CVEs listed in the CISA Known "
+                    f"Exploited Vulnerabilities catalog, meaning they are actively exploited in "
+                    f"the wild. Immediate patching is required."
+                ),
+                remediation=[
+                    "sudo apt update && sudo apt upgrade -y  # Debian/Ubuntu",
+                    "sudo dnf update -y  # RHEL/Fedora",
+                    f"Affected packages: {', '.join(kev_pkg_names)}",
+                    f"KEV advisory IDs: {', '.join(kev_ids_list)}",
+                ],
+                evidence=f"KEV hits: {', '.join(adv_id for _, adv_id in kev_hits[:10])}",
+                score=10,
+            ))
+
+        # --- High/Critical severity CVEs ---
+        if high_crit_hits:
+            hc_pkg_names = sorted({k.split(":")[1] for k, _ in high_crit_hits})[:5]
+            findings.append(Finding(
+                host_ip=host.ip,
+                category="vulnerabilities",
+                severity=Severity.HIGH,
+                title=f"{len(high_crit_hits)} High/Critical severity CVE(s) in installed packages",
+                description=(
+                    f"{len(high_crit_hits)} installed package(s) have High or Critical severity "
+                    f"CVEs. These should be patched promptly."
+                ),
+                remediation=[
+                    "sudo apt update && sudo apt upgrade -y  # Debian/Ubuntu",
+                    "sudo dnf update -y  # RHEL/Fedora",
+                    f"Affected packages: {', '.join(hc_pkg_names)}",
+                    "Press v then switch to Vulnerabilities tab for the full list",
+                ],
+                evidence=f"High/Critical CVEs: {', '.join(adv_id for _, adv_id in high_crit_hits[:10])}",
+                score=5,
+            ))
+
+        # --- Total CVE count finding ---
+        if total >= 50:
+            sev, score = Severity.CRITICAL, 10
+        elif total >= 21:
+            sev, score = Severity.HIGH, 5
+        elif total >= 6:
+            sev, score = Severity.MEDIUM, 2
+        else:
+            sev, score = Severity.LOW, 1
+
+        findings.append(Finding(
+            host_ip=host.ip,
+            category="vulnerabilities",
+            severity=sev,
+            title=f"{total} CVE(s) found across installed packages",
+            description=(
+                f"{total} CVE advisories matched against the package inventory for this host. "
+                f"Use the Vulnerabilities tab for the full list."
+            ),
+            remediation=[
+                "sudo apt update && sudo apt upgrade -y  # Debian/Ubuntu",
+                "sudo dnf update -y  # RHEL/Fedora",
+                "Press v to refresh vulnerability data, then review the Vulnerabilities tab",
+            ],
+            evidence=f"Total advisories: {total}  |  KEV hits: {len(kev_hits)}  |  High/Crit: {len(high_crit_hits)}",
+            score=score,
+        ))
+
+        return findings
