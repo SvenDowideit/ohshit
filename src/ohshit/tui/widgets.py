@@ -511,15 +511,39 @@ class SbomTab(Widget):
         vuln_str = f"  |  {total_vulns} CVEs" if total_vulns else ""
         hdr.update(f"{host_name}  —  {count} packages  (collected {ts_str}){vuln_str}")
 
+        _SEVER_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4, "": 4}
+
         def _sort_key(p: dict):
+            key = f"{p.get('source', '')}:{p.get('name', '')}:{p.get('version', '')}"
+            advisories = (vuln_matches or {}).get(key, [])
+
+            # Worst severity among all advisories for this package
+            worst = 4
+            kev_hit = False
+            for adv in advisories:
+                sev = (adv.get("severity") or "").lower()
+                worst = min(worst, _SEVER_RANK.get(sev, 4))
+                if adv.get("source") == "kev":
+                    kev_hit = True
+
+            cve_count = len(advisories)
+
             ra = p.get("released_at")
             if ra is None:
-                return datetime.min.replace(tzinfo=timezone.utc)
-            if ra.tzinfo is None:
-                ra = ra.replace(tzinfo=timezone.utc)
-            return ra
+                released_ts = datetime.min.replace(tzinfo=timezone.utc)
+            else:
+                released_ts = ra if ra.tzinfo else ra.replace(tzinfo=timezone.utc)
 
-        for pkg in sorted(packages, key=_sort_key, reverse=True):
+            # Sort: KEV hits first, then worst severity, then CVE count desc,
+            # then released_at desc (newest first among equal-vuln packages)
+            return (
+                0 if kev_hit else 1,       # KEV first
+                worst,                      # lower = more severe = sort first
+                -cve_count,                 # more CVEs = sort first
+                -released_ts.timestamp(),   # newer = lower negative = sort first
+            )
+
+        for pkg in sorted(packages, key=_sort_key):
             ra = pkg.get("released_at")
             if ra is None:
                 age_str = "unknown"
