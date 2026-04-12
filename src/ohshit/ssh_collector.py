@@ -104,6 +104,30 @@ class RemoteCollector:
             raw["shadow_empty_pw"] = []
 
 
+def _apply_os_release(host: Host, raw: dict) -> None:
+    """Parse uname + os-release data from raw SSH output into host fields."""
+    uname = raw.get("uname", "")
+    if uname:
+        parts = uname.split()
+        # uname -a: kernel name, nodename, release, version, machine, ...
+        if len(parts) >= 3:
+            host.kernel_version = parts[2]
+        if len(parts) >= 1:
+            host.os_guess = host.os_guess or parts[0]
+
+    os_release_raw = raw.get("os_release", "")
+    if os_release_raw:
+        parsed: dict[str, str] = {}
+        for line in os_release_raw.splitlines():
+            line = line.strip()
+            if "=" in line:
+                k, _, v = line.partition("=")
+                parsed[k.strip()] = v.strip().strip('"')
+        if parsed:
+            host.os_release = parsed
+            host.os_guess = host.os_guess or parsed.get("PRETTY_NAME") or parsed.get("NAME")
+
+
 def _summarise_error(exc: Exception) -> str:
     name = type(exc).__name__
     msg = str(exc)

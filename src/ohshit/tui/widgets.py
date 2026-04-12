@@ -138,6 +138,9 @@ class HostDetailTab(Widget):
         yield Label("", id="detail-kernel")
         yield Label("", id="detail-mac")
         yield Label("", id="detail-ssh")
+        yield Label("", id="detail-vendor")
+        yield Label("", id="detail-iot")
+        yield Label("", id="detail-repurpose")
         yield Label("Open Ports:", id="ports-label")
         yield DataTable(id="ports-table")
 
@@ -150,10 +153,9 @@ class HostDetailTab(Widget):
             self.query_one("#detail-header", Label).update(
                 "← Select a host from the list to see details"
             )
-            self.query_one("#detail-os", Label).update("")
-            self.query_one("#detail-kernel", Label).update("")
-            self.query_one("#detail-mac", Label).update("")
-            self.query_one("#detail-ssh", Label).update("")
+            for wid in ("detail-os", "detail-kernel", "detail-mac", "detail-ssh",
+                        "detail-vendor", "detail-iot", "detail-repurpose"):
+                self.query_one(f"#{wid}", Label).update("")
             self.query_one("#ports-table", DataTable).clear(columns=False)
             return
 
@@ -177,6 +179,41 @@ class HostDetailTab(Widget):
         if host.ssh_error:
             ssh_info += f"  ({host.ssh_error})"
         self.query_one("#detail-ssh", Label).update(f"SSH: {ssh_info}")
+
+        # IoT vendor / device type
+        iot = host.iot_info
+        vendor_parts = []
+        if iot.vendor:
+            vendor_parts.append(iot.vendor)
+        if iot.device_type:
+            vendor_parts.append(f"({iot.device_type})")
+        self.query_one("#detail-vendor", Label).update(
+            f"Vendor: {' '.join(vendor_parts)}" if vendor_parts else ""
+        )
+
+        # IoT identifiers: mDNS names, UPnP, HA entity, detection methods
+        iot_parts: list[str] = []
+        if iot.mdns_names:
+            iot_parts.append(f"mDNS: {', '.join(iot.mdns_names)}")
+        if iot.upnp_friendly_name:
+            name_str = iot.upnp_friendly_name
+            if iot.upnp_model:
+                name_str += f" / {iot.upnp_model}"
+            iot_parts.append(f"UPnP: {name_str}")
+        if iot.ha_entity_id:
+            iot_parts.append(f"HA: {iot.ha_entity_id}")
+        if iot.detection_methods:
+            iot_parts.append(f"via {', '.join(iot.detection_methods)}")
+        self.query_one("#detail-iot", Label).update("  ".join(iot_parts) if iot_parts else "")
+
+        # Hardware repurposing warning
+        repurpose = host.repurpose_note
+        if repurpose:
+            self.query_one("#detail-repurpose", Label).update(
+                Text(f"  WARNING: {repurpose}  ", style="bold white on dark_red")
+            )
+        else:
+            self.query_one("#detail-repurpose", Label).update("")
 
         tbl = self.query_one("#ports-table", DataTable)
         tbl.clear(columns=False)
