@@ -1,0 +1,117 @@
+/* Oh-Shit Network Security Dashboard — Textual CSS */
+
+Screen {
+    layout: vertical;
+}
+
+#main-body {
+    layout: horizontal;
+    height: 1fr;
+}
+
+#host-panel {
+    width: 32;
+    min-width: 24;
+    border-right: solid $primary;
+    overflow-y: scroll;
+}
+
+#host-panel-title {
+    background: $primary;
+    color: $text;
+    width: 100%;
+    text-align: center;
+    padding: 0 1;
+}
+
+#right-panel {
+    width: 1fr;
+}
+
+#bottom-panel {
+    height: 9;
+    border-top: solid $primary;
+    layout: vertical;
+}
+
+#scan-progress {
+    height: 3;
+    padding: 0 1;
+}
+
+#log-feed {
+    height: 6;
+    padding: 0 1;
+}
+
+HostListItem {
+    height: 1;
+    padding: 0;
+}
+
+HostListItem > Horizontal {
+    height: 1;
+}
+
+.host-name {
+    width: 1fr;
+    padding: 0 1;
+    overflow: hidden;
+}
+
+.host-state {
+    width: auto;
+    color: $text-muted;
+    text-style: dim;
+}
+
+/* Risk badge colours */
+.badge-critical { background: $error; color: $text; }
+.badge-high     { background: $warning; color: $text-muted; }
+.badge-medium   { background: $warning-lighten-2; color: $text-muted; }
+.badge-low      { background: $success; color: $text; }
+.badge-info     { background: $accent; color: $text; }
+
+/* Host detail panel */
+#detail-header {
+    background: $surface;
+    padding: 0 1;
+    width: 100%;
+    margin-bottom: 1;
+}
+
+#detail-os, #detail-kernel, #detail-mac, #detail-ssh {
+    padding: 0 1;
+}
+
+#ports-label {
+    padding: 1 1 0 1;
+    text-style: bold;
+}
+
+/* Remediation panel */
+.remed-title {
+    text-style: bold;
+    padding: 1 1 0 1;
+}
+
+.remed-desc {
+    color: $text-muted;
+    padding: 0 2;
+}
+
+.remed-step {
+    color: $success;
+    padding: 0 2;
+}
+
+.remed-sep {
+    color: $surface-lighten-2;
+    padding: 0 1;
+}
+
+/* Progress bar area */
+#step-label {
+    color: $text-muted;
+    text-style: dim;
+}

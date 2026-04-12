@@ -1,0 +1,30 @@
+[project]
+name = "ohshit"
+version = "0.1.0"
+description = "Home network security dashboard"
+authors = [
+    { name = "Sven Dowideit", email = "SvenDowideit@home.org.au" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "textual>=0.80.0",
+    "asyncssh>=2.18.0",
+    "cryptography>=42.0.0",
+    "aiohttp>=3.9.0",
+    "aiofiles>=23.2.1",
+    "rich>=13.7.0",
+]
+
+[project.scripts]
+ohshit = "ohshit.main:run"
+
+[build-system]
+requires = ["uv_build>=0.11.6,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "textual-dev>=0.80.0",
+]

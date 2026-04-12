@@ -1,0 +1,259 @@
+from __future__ import annotations
+
+from rich.text import Text
+from textual.app import ComposeResult
+from textual.message import Message
+from textual.reactive import reactive
+from textual.widget import Widget
+from textual.widgets import (
+    DataTable,
+    Label,
+    ListItem,
+    ListView,
+    ProgressBar,
+    RichLog,
+    Static,
+    TabbedContent,
+    TabPane,
+)
+from textual.containers import Horizontal, VerticalScroll
+
+from ..models import Finding, Host, HostState, ScanResult, Severity
+
+
+# ---------------------------------------------------------------------------
+# Severity colour helpers
+# ---------------------------------------------------------------------------
+
+SEVERITY_STYLES: dict[Severity, str] = {
+    Severity.CRITICAL: "bold white on red",
+    Severity.HIGH: "bold black on yellow",
+    Severity.MEDIUM: "black on dark_orange3",
+    Severity.LOW: "black on green",
+    Severity.INFO: "white on blue",
+}
+
+SEVERITY_CSS_CLASSES: dict[Severity, str] = {
+    Severity.CRITICAL: "badge-critical",
+    Severity.HIGH: "badge-high",
+    Severity.MEDIUM: "badge-medium",
+    Severity.LOW: "badge-low",
+    Severity.INFO: "badge-info",
+}
+
+
+def _sev_text(label: str, sev: Severity) -> Text:
+    return Text(label, style=SEVERITY_STYLES.get(sev, ""))
+
+
+# ---------------------------------------------------------------------------
+# NetworkRiskBadge
+# ---------------------------------------------------------------------------
+
+class NetworkRiskBadge(Static):
+    """Small inline coloured badge showing a severity label."""
+
+    DEFAULT_CSS = """
+    NetworkRiskBadge {
+        width: auto;
+        padding: 0 1;
+    }
+    """
+
+    def __init__(self, severity: Severity, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self._severity = severity
+
+    def on_mount(self) -> None:
+        self._refresh_label()
+
+    def update_severity(self, sev: Severity) -> None:
+        self._severity = sev
+        self._refresh_label()
+
+    def _refresh_label(self) -> None:
+        short = self._severity.value[:4].upper()
+        self.update(Text(f" {short} ", style=SEVERITY_STYLES[self._severity]))
+        self.remove_class(*SEVERITY_CSS_CLASSES.values())
+        self.add_class(SEVERITY_CSS_CLASSES[self._severity])
+
+
+# ---------------------------------------------------------------------------
+# HostListPanel
+# ---------------------------------------------------------------------------
+
+class HostListItem(ListItem):
+    def __init__(self, host: Host) -> None:
+        super().__init__()
+        self.host = host
+
+    def compose(self) -> ComposeResult:
+        with Horizontal():
+            yield NetworkRiskBadge(self.host.risk_label)
+            yield Label(
+                self.host.display_name,
+                classes="host-name",
+            )
+            yield Label(
+                self.host.state.value,
+                classes="host-state",
+            )
+
+
+class HostListPanel(Widget):
+    class HostSelected(Message):
+        def __init__(self, ip: str) -> None:
+            super().__init__()
+            self.ip = ip
+
+    def compose(self) -> ComposeResult:
+        yield Label("Hosts", id="host-panel-title")
+        yield ListView(id="host-list")
+
+    def update_hosts(self, result: ScanResult) -> None:
+        lv = self.query_one("#host-list", ListView)
+        lv.clear()
+        for host in sorted(result.hosts.values(), key=lambda h: (-h.risk_score, h.ip)):
+            lv.append(HostListItem(host))
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        item = event.item
+        if isinstance(item, HostListItem):
+            self.post_message(self.HostSelected(item.host.ip))
+
+
+# ---------------------------------------------------------------------------
+# HostDetailTab
+# ---------------------------------------------------------------------------
+
+class HostDetailTab(Widget):
+    def compose(self) -> ComposeResult:
+        yield Label("", id="detail-header")
+        yield Label("", id="detail-os")
+        yield Label("", id="detail-kernel")
+        yield Label("", id="detail-mac")
+        yield Label("", id="detail-ssh")
+        yield Label("Open Ports:", id="ports-label")
+        yield DataTable(id="ports-table")
+
+    def on_mount(self) -> None:
+        tbl = self.query_one("#ports-table", DataTable)
+        tbl.add_columns("Port", "Proto", "State", "Service", "Version")
+
+    def update_host(self, host: Host | None) -> None:
+        if host is None:
+            self.query_one("#detail-header", Label).update("Select a host")
+            return
+
+        name = host.display_name
+        risk = host.risk_label.value
+        self.query_one("#detail-header", Label).update(
+            Text(f"  {name}  —  {risk} risk (score {host.risk_score})  ",
+                 style=SEVERITY_STYLES.get(host.risk_label, ""))
+        )
+
+        os_info = host.os_guess or ""
+        if host.os_release:
+            pretty = host.os_release.get("PRETTY_NAME") or host.os_release.get("NAME", "")
+            if pretty:
+                os_info = pretty + (f"  [{os_info}]" if os_info else "")
+        self.query_one("#detail-os", Label).update(f"OS: {os_info or 'unknown'}")
+        self.query_one("#detail-kernel", Label).update(f"Kernel: {host.kernel_version or 'unknown'}")
+        self.query_one("#detail-mac", Label).update(f"MAC: {host.mac or 'unknown'}  |  IP: {host.ip}")
+
+        ssh_info = host.state.value
+        if host.ssh_error:
+            ssh_info += f"  ({host.ssh_error})"
+        self.query_one("#detail-ssh", Label).update(f"SSH: {ssh_info}")
+
+        tbl = self.query_one("#ports-table", DataTable)
+        tbl.clear(columns=False)
+        for p in sorted(host.open_ports, key=lambda x: x.port):
+            if p.state == "open":
+                tbl.add_row(str(p.port), p.protocol, p.state, p.service, p.version)
+
+
+# ---------------------------------------------------------------------------
+# FindingsTable
+# ---------------------------------------------------------------------------
+
+class FindingsTable(Widget):
+    def compose(self) -> ComposeResult:
+        yield DataTable(id="findings-dt")
+
+    def on_mount(self) -> None:
+        tbl = self.query_one("#findings-dt", DataTable)
+        tbl.add_columns("Sev", "Category", "Title", "Score")
+        tbl.cursor_type = "row"
+
+    def update_host(self, host: Host | None) -> None:
+        tbl = self.query_one("#findings-dt", DataTable)
+        tbl.clear(columns=False)
+        if host is None:
+            return
+        for f in sorted(host.findings, key=lambda x: x.score, reverse=True):
+            tbl.add_row(
+                _sev_text(f.severity.value[:4], f.severity),
+                f.category,
+                f.title,
+                str(f.score),
+            )
+
+
+# ---------------------------------------------------------------------------
+# RemediationPanel
+# ---------------------------------------------------------------------------
+
+class RemediationPanel(Widget):
+    def compose(self) -> ComposeResult:
+        yield VerticalScroll(id="remed-scroll")
+
+    def update_host(self, host: Host | None) -> None:
+        scroll = self.query_one("#remed-scroll", VerticalScroll)
+        scroll.remove_children()
+        if host is None or not host.findings:
+            scroll.mount(Label("No findings."))
+            return
+
+        for f in sorted(host.findings, key=lambda x: x.score, reverse=True):
+            header = Text(
+                f"[{f.severity.value.upper()}] {f.title}",
+                style=SEVERITY_STYLES.get(f.severity, ""),
+            )
+            scroll.mount(Static(header, classes="remed-title"))
+            scroll.mount(Static(f.description, classes="remed-desc"))
+            if f.remediation:
+                for step in f.remediation:
+                    scroll.mount(Static(f"  $ {step}", classes="remed-step"))
+            scroll.mount(Static("─" * 60, classes="remed-sep"))
+
+
+# ---------------------------------------------------------------------------
+# ScanProgressBar
+# ---------------------------------------------------------------------------
+
+class ScanProgressBar(Widget):
+    step_name: reactive[str] = reactive("Idle")
+    progress: reactive[float] = reactive(0.0)
+
+    def compose(self) -> ComposeResult:
+        yield Label("", id="step-label")
+        yield ProgressBar(total=100, show_eta=False, id="prog-bar")
+
+    def watch_step_name(self, name: str) -> None:
+        self.query_one("#step-label", Label).update(name)
+
+    def watch_progress(self, val: float) -> None:
+        self.query_one("#prog-bar", ProgressBar).progress = val
+
+
+# ---------------------------------------------------------------------------
+# LogFeed
+# ---------------------------------------------------------------------------
+
+class LogFeed(Widget):
+    def compose(self) -> ComposeResult:
+        yield RichLog(max_lines=200, highlight=True, markup=True, id="rich-log")
+
+    def write(self, line: str) -> None:
+        self.query_one("#rich-log", RichLog).write(line)
