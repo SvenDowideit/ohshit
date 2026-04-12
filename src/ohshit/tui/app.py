@@ -113,6 +113,8 @@ class OhShitApp(App[None]):
         self._sbom_packages: dict[str, list[dict]] = {}
         # Cache: ip -> vuln_matches dict for the Vulns tab
         self._vuln_matches: dict[str, dict[str, list[dict]]] = {}
+        # KEV IDs cached in memory — updated whenever vuln data is refreshed
+        self._kev_ids: frozenset[str] = frozenset()
 
     # ------------------------------------------------------------------
     # Layout
@@ -195,6 +197,7 @@ class OhShitApp(App[None]):
             cached = {}
 
         kev = kev_ids()
+        self._kev_ids = kev
 
         loaded = 0
         for ip, (queried_at, matches) in cached.items():
@@ -236,6 +239,7 @@ class OhShitApp(App[None]):
         try:
             refresh_kev(log_cb=self._thread_safe_log)
             kev = kev_ids()
+            self._kev_ids = kev
         except Exception as exc:
             self._thread_safe_log(f"[dim red]Vuln:[/dim red] KEV refresh failed: {exc}")
 
@@ -314,6 +318,12 @@ class OhShitApp(App[None]):
                     pass
             self._reader = DB.open_reader(self._db_path)
             self._hosts = DB.load_all_hosts(self._reader)
+            # Re-apply any vuln findings we already have in memory —
+            # load_all_hosts returns hosts with only DB-persisted findings
+            # (no vuln category), so we must re-merge here to keep scores stable.
+            if self._vuln_matches:
+                for ip, matches in self._vuln_matches.items():
+                    self._apply_vuln_findings(ip, matches, self._kev_ids)
             summary = DB.load_scan_summary(self._reader)
             self._update_subtitle(summary)
             # Refresh SBOM packages from sbom_index in the same DB
@@ -464,7 +474,9 @@ class OhShitApp(App[None]):
                 )
                 # Persist, update risk findings, refresh UI
                 self._vuln_matches[ip] = matches
-                self._apply_vuln_findings(ip, matches, kev_ids())
+                kev = kev_ids()
+                self._kev_ids = kev
+                self._apply_vuln_findings(ip, matches, kev)
                 writer = DB.open_writer(self._db_path)
                 DB.save_vuln_cache(writer, ip, matches)
                 writer.close()
