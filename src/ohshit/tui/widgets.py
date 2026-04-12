@@ -99,6 +99,13 @@ class HostListItem(ListItem):
                 classes="host-state",
             )
 
+    def refresh_host(self, host: Host) -> None:
+        """Update badge, name, and state label in-place without re-mounting."""
+        self.host = host
+        self.query_one(NetworkRiskBadge).update_severity(host.risk_label)
+        self.query_one(".host-name", Label).update(host.display_name)
+        self.query_one(".host-state", Label).update(host.state.value)
+
 
 class HostListPanel(Widget):
     class HostSelected(Message):
@@ -110,11 +117,63 @@ class HostListPanel(Widget):
         yield Label("Hosts", id="host-panel-title")
         yield ListView(id="host-list")
 
+    # Ordered list of IPs as currently rendered (matches ListView children order)
+    _rendered_order: list[str]
+
+    def on_mount(self) -> None:
+        self._rendered_order = []
+
     async def update_hosts(self, result: ScanResult) -> None:
+        desired_order = [
+            h.ip for h in sorted(result.hosts.values(), key=lambda h: (-h.risk_score, h.ip))
+        ]
         lv = self.query_one("#host-list", ListView)
-        await lv.clear()
-        for host in sorted(result.hosts.values(), key=lambda h: (-h.risk_score, h.ip)):
-            await lv.append(HostListItem(host))
+        rendered = self._rendered_order
+
+        # Build index of currently rendered items by IP
+        items_by_ip: dict[str, HostListItem] = {
+            item.host.ip: item
+            for item in lv.query(HostListItem)
+        }
+
+        # 1. Update or add each host
+        for ip in desired_order:
+            host = result.hosts[ip]
+            if ip in items_by_ip:
+                items_by_ip[ip].refresh_host(host)
+            else:
+                new_item = HostListItem(host)
+                await lv.append(new_item)
+                items_by_ip[ip] = new_item
+
+        # 2. Remove hosts that are no longer in the result (shouldn't happen,
+        #    but guard against stale items)
+        for ip, item in list(items_by_ip.items()):
+            if ip not in result.hosts:
+                await item.remove()
+                del items_by_ip[ip]
+
+        # 3. Reorder only if the desired order differs from rendered order
+        if desired_order != rendered:
+            for target_idx, ip in enumerate(desired_order):
+                item = items_by_ip[ip]
+                # Re-query live children each iteration since moves change positions
+                current_children = list(lv.query(HostListItem))
+                current_idx = current_children.index(item)
+                if current_idx != target_idx:
+                    await item.remove()
+                    if target_idx == 0:
+                        # Find the new first child after removal
+                        remaining = list(lv.query(HostListItem))
+                        if remaining:
+                            await lv.mount(items_by_ip[ip], before=remaining[0])
+                        else:
+                            await lv.append(items_by_ip[ip])
+                    else:
+                        anchor_ip = desired_order[target_idx - 1]
+                        await lv.mount(items_by_ip[ip], after=items_by_ip[anchor_ip])
+
+        self._rendered_order = list(desired_order)
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         item = event.item
