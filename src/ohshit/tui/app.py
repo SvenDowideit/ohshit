@@ -56,7 +56,7 @@ from ..sbom import (
     should_collect_sbom,
     write_sbom,
 )
-from ..ssh_collector import collect_all, _apply_os_release
+from ..ssh_collector import collect_all, _apply_os_release, LocalCollector, RemoteCollector, get_local_ips
 from .widgets import (
     FindingsTable,
     HostDetailTab,
@@ -687,6 +687,11 @@ async def _scanner_async(
     iot_sem = asyncio.Semaphore(20)
     done = 0
 
+    # Detect which IPs belong to this machine so we can skip SSH for them
+    local_ips = get_local_ips()
+    if local_ips:
+        log_cb(f"[dim]Local IPs detected: {', '.join(sorted(local_ips))} — will use local shell[/dim]")
+
     scan_id = DB.start_scan_log(writer, result.network_cidr, result.gateway_ip)
 
     async def process_host(host: Host) -> None:
@@ -703,13 +708,18 @@ async def _scanner_async(
             )
             _merge_iot(host.iot_info, iot)
 
-        # SSH collection
+        # Collection: local shell for this machine, SSH for everything else
         raw: dict[str, Any] = {}
         if not no_ssh and host.state.value != "Unreachable":
-            from ..ssh_collector import RemoteCollector
-            async with ssh_sem:
-                collector = RemoteCollector()
+            is_local = host.ip in local_ips
+            if is_local:
+                collector: Any = LocalCollector()
+                log_cb(f"[dim]Local:[/dim] {host.display_name} — collecting via local shell")
                 raw = await collector.collect(host)
+            else:
+                async with ssh_sem:
+                    collector = RemoteCollector()
+                    raw = await collector.collect(host)
             if raw:
                 _apply_os_release(host, raw)
                 host.last_scan = datetime.now()
@@ -788,10 +798,15 @@ async def _collect_sbom_only(
     sbom_base: Path,
     log_cb: Any,
 ) -> None:
-    """SSH into a single host and collect its SBOM only — no rescan, no risk analysis."""
-    from ..ssh_collector import RemoteCollector
+    """Collect SBOM for a single host — no rescan, no risk analysis.
+    Uses local shell if the host is this machine, SSH otherwise."""
+    local_ips = get_local_ips()
+    if host.ip in local_ips:
+        log_cb(f"[dim]SBOM:[/dim] {host.display_name} — collecting via local shell")
+        collector: Any = LocalCollector()
+    else:
+        collector = RemoteCollector()
 
-    collector = RemoteCollector()
     raw = await collector.collect(host)
     if not raw:
         log_cb(f"[dim]SBOM:[/dim] {host.display_name} — SSH failed, cannot collect packages")

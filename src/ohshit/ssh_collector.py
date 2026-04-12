@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import socket
+import struct
 from typing import Any, Callable
 
 from .models import Host, HostState, PortInfo
@@ -245,6 +247,107 @@ def _summarise_error(exc: Exception) -> str:
     name = type(exc).__name__
     msg = str(exc)
     return f"{name}: {msg[:120]}" if msg else name
+
+
+def get_local_ips() -> frozenset[str]:
+    """Return all IPv4 addresses assigned to local interfaces (excluding loopback)."""
+    ips: set[str] = set()
+    # Use `ip addr` output via a synchronous subprocess for simplicity
+    try:
+        import subprocess
+        out = subprocess.check_output(["ip", "addr"], text=True, timeout=5)
+        for line in out.splitlines():
+            m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/\d+", line)
+            if m:
+                ip = m.group(1)
+                if not ip.startswith("127."):
+                    ips.add(ip)
+    except Exception:
+        pass
+    # Fallback: hostname resolution
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith("127."):
+                ips.add(ip)
+    except Exception:
+        pass
+    return frozenset(ips)
+
+
+class LocalCollector:
+    """Collect security data from the local machine using shell subprocesses.
+
+    Runs the same commands as RemoteCollector but via asyncio.create_subprocess_shell
+    instead of SSH — used when the target host IS the machine running oh-shit.
+    """
+
+    async def collect(self, host: Host) -> dict[str, Any]:
+        host.state = HostState.SCANNING
+        try:
+            raw = await self._run_commands()
+            await self._check_shadow(raw)
+            host.state = HostState.SSH_SUCCESS
+            # Mark clearly that this was local collection
+            host.ssh_error = None
+            return raw
+        except Exception as exc:
+            host.state = HostState.SSH_FAILED
+            host.ssh_error = f"local collection failed: {exc}"
+            return {}
+
+    async def _run_commands(self) -> dict[str, Any]:
+        keys = list(RAW_COMMANDS.keys())
+        cmds = list(RAW_COMMANDS.values())
+
+        async def run_one(cmd: str) -> str:
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                try:
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+                    return stdout.decode(errors="replace") if stdout else ""
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    return ""
+            except Exception:
+                return ""
+
+        BATCH = 8
+        outputs: list[str] = []
+        for i in range(0, len(cmds), BATCH):
+            batch_results = await asyncio.gather(*[run_one(c) for c in cmds[i:i + BATCH]])
+            outputs.extend(batch_results)
+
+        return dict(zip(keys, outputs))
+
+    async def _check_shadow(self, raw: dict[str, Any]) -> None:
+        async def run(cmd: str) -> str:
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+                return stdout.decode(errors="replace") if stdout else ""
+            except Exception:
+                return ""
+
+        out = await run("test -r /etc/shadow && echo READABLE || echo NOREAD")
+        raw["shadow_readable"] = "READABLE" in out
+
+        if raw.get("shadow_readable"):
+            out2 = await run(
+                "awk -F: '($2 == \"\" || $2 == \"!\") {print $1}' /etc/shadow 2>/dev/null || true"
+            )
+            raw["shadow_empty_pw"] = [u for u in out2.splitlines() if u.strip()]
+        else:
+            raw["shadow_empty_pw"] = []
 
 
 async def collect_all(
