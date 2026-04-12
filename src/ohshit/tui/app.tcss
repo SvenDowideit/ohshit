@@ -119,8 +119,13 @@ HostListItem > Horizontal {
     margin-bottom: 1;
 }
 
-#detail-os, #detail-kernel, #detail-mac, #detail-ssh {
+#detail-os, #detail-kernel, #detail-mac, #detail-ssh, #detail-seen {
     padding: 0 1;
+}
+
+#detail-seen {
+    color: $text-muted;
+    text-style: dim;
 }
 
 #ports-label {

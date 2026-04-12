@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.message import Message
@@ -19,6 +21,30 @@ from textual.widgets import (
 from textual.containers import Horizontal, VerticalScroll
 
 from ..models import Finding, Host, HostState, ScanResult, Severity
+
+
+def _ago(dt: datetime | None) -> str:
+    """Return a compact relative-time string like '3 m ago' or '2 d ago'."""
+    if dt is None:
+        return "never"
+    now = datetime.now(timezone.utc) if dt.tzinfo else datetime.now()
+    secs = max(0, (now - dt).total_seconds())
+    if secs < 90:
+        return "just now"
+    if secs < 3600:
+        return f"{int(secs // 60)} m ago"
+    if secs < 86400:
+        return f"{int(secs // 3600)} h ago"
+    if secs < 86400 * 14:
+        return f"{int(secs // 86400)} d ago"
+    return dt.strftime("%Y-%m-%d")
+
+
+def _fmt_ts(dt: datetime | None) -> str:
+    """Return a full timestamp string, or 'never'."""
+    if dt is None:
+        return "never"
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
 # ---------------------------------------------------------------------------
@@ -107,8 +133,6 @@ class HostListItem(ListItem):
             self.query_one(".host-name", Label).update(host.display_name)
             self.query_one(".host-state", Label).update(host.state.value)
         except Exception:
-            # Children not yet mounted (item was just appended); compose() will
-            # use self.host when it runs, so nothing more needed here.
             pass
 
 
@@ -202,6 +226,7 @@ class HostDetailTab(Widget):
         yield Label("", id="detail-kernel")
         yield Label("", id="detail-mac")
         yield Label("", id="detail-ssh")
+        yield Label("", id="detail-seen")
         yield Label("", id="detail-vendor")
         yield Label("", id="detail-iot")
         yield Label("", id="detail-repurpose")
@@ -218,7 +243,7 @@ class HostDetailTab(Widget):
                 "← Select a host from the list to see details"
             )
             for wid in ("detail-os", "detail-kernel", "detail-mac", "detail-ssh",
-                        "detail-vendor", "detail-iot", "detail-repurpose"):
+                        "detail-seen", "detail-vendor", "detail-iot", "detail-repurpose"):
                 self.query_one(f"#{wid}", Label).update("")
             self.query_one("#ports-table", DataTable).clear(columns=False)
             return
@@ -243,6 +268,12 @@ class HostDetailTab(Widget):
         if host.ssh_error:
             ssh_info += f"  ({host.ssh_error})"
         self.query_one("#detail-ssh", Label).update(f"SSH: {ssh_info}")
+
+        seen_parts = [f"first seen {_fmt_ts(host.first_seen)}"]
+        seen_parts.append(f"last seen {_fmt_ts(host.last_seen)}")
+        if host.last_scan:
+            seen_parts.append(f"last scanned {_fmt_ts(host.last_scan)}")
+        self.query_one("#detail-seen", Label).update("  |  ".join(seen_parts))
 
         # IoT vendor / device type + MAC permanence
         iot = host.iot_info
