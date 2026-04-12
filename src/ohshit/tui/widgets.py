@@ -477,7 +477,7 @@ class SbomTab(Widget):
 
     def on_mount(self) -> None:
         tbl = self.query_one("#sbom-table", DataTable)
-        tbl.add_columns("Installed", "Source", "Name", "Version", "Arch")
+        tbl.add_columns("Released", "Source", "Name", "Version", "Arch")
         tbl.cursor_type = "row"
 
     def update_sbom(self, packages: list[dict], host: "Host | None" = None) -> None:
@@ -502,22 +502,22 @@ class SbomTab(Widget):
         now = datetime.now(timezone.utc)
 
         def _sort_key(p: dict):
-            ia = p.get("installed_at")
+            ra = p.get("released_at")
             # Packages with no date sort to the end (oldest-looking)
-            if ia is None:
+            if ra is None:
                 return datetime.min.replace(tzinfo=timezone.utc)
-            if ia.tzinfo is None:
-                ia = ia.replace(tzinfo=timezone.utc)
-            return ia
+            if ra.tzinfo is None:
+                ra = ra.replace(tzinfo=timezone.utc)
+            return ra
 
         for pkg in sorted(packages, key=_sort_key, reverse=True):
-            ia = pkg.get("installed_at")
-            if ia is None:
+            ra = pkg.get("released_at")
+            if ra is None:
                 age_str = "unknown"
             else:
-                if ia.tzinfo is None:
-                    ia = ia.replace(tzinfo=timezone.utc)
-                age_str = _ago(ia)
+                if ra.tzinfo is None:
+                    ra = ra.replace(tzinfo=timezone.utc)
+                age_str = _ago(ra)
 
             tbl.add_row(
                 age_str,

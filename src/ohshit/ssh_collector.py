@@ -24,13 +24,12 @@ RAW_COMMANDS: dict[str, str] = {
     "apt_upgradable":   "apt list --upgradable 2>/dev/null || true",
     # SBOM collection commands
     "sbom_dpkg":        "dpkg-query -W -f=$'${Package}\\t${Version}\\t${Architecture}\\n' 2>/dev/null || true",
-    "sbom_dpkg_dates":  "stat -c $'%n\\t%Y' /var/lib/dpkg/info/*.list 2>/dev/null || true",
-    "sbom_rpm":         "rpm -qa --queryformat $'%{NAME}\\t%{VERSION}-%{RELEASE}\\t%{ARCH}\\t%{INSTALLTIME}\\n' 2>/dev/null || true",
+    "sbom_dpkg_dates":  "stat -c $'%n\\t%Y' /var/lib/dpkg/info/*.md5sums 2>/dev/null || true",
+    "sbom_rpm":         "rpm -qa --queryformat $'%{NAME}\\t%{VERSION}-%{RELEASE}\\t%{ARCH}\\t%{BUILDTIME}\\n' 2>/dev/null || true",
     "sbom_snap":        "snap list 2>/dev/null || true",
     "sbom_flatpak":     "flatpak list --columns=application,version,origin 2>/dev/null || true",
     "sbom_pip":         "pip3 list --format=freeze 2>/dev/null || pip list --format=freeze 2>/dev/null || true",
     "sbom_pip_user":    "pip3 list --user --format=freeze 2>/dev/null || true",
-    "sbom_pip_dates":   "stat -c $'%n\\t%Y' /usr/lib/python3*/dist-packages/*.dist-info/METADATA /usr/local/lib/python3*/dist-packages/*.dist-info/METADATA ~/.local/lib/python3*/site-packages/*.dist-info/METADATA 2>/dev/null || true",
 }
 
 

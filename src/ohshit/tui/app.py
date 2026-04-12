@@ -273,10 +273,34 @@ class OhShitApp(App[None]):
         if not self.selected_ip:
             self._log("[yellow]No host selected.[/yellow]")
             return
-        if self.scan_running:
-            self._log("[yellow]Scan already running.[/yellow]")
+        host = self._hosts.get(self.selected_ip)
+        if host is None:
+            self._log("[yellow]Selected host not found in DB.[/yellow]")
             return
-        self._launch_scanner_thread(single_ip=self.selected_ip, force_sbom=True)
+        self._log(f"[cyan]Collecting SBOM for {host.display_name}…[/cyan]")
+
+        db_path = self._db_path
+        sbom_base = db_path.parent
+
+        def _sbom_thread() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(
+                    _collect_sbom_only(
+                        host=host,
+                        db_path=db_path,
+                        sbom_base=sbom_base,
+                        log_cb=self._thread_safe_log,
+                    )
+                )
+            except Exception as exc:
+                self._thread_safe_log(f"[bold red]SBOM collection error:[/bold red] {exc}")
+            finally:
+                loop.close()
+                DB.data_changed.set()
+
+        threading.Thread(target=_sbom_thread, daemon=True, name="ohshit-sbom").start()
 
     async def action_export_report(self) -> None:
         if not self._hosts:
@@ -554,6 +578,52 @@ async def _scanner_async(
     log_cb(
         f"[bold]Scan complete.[/bold] {total} hosts  |  "
         f"Use [bold]↑↓[/bold] to browse · [bold]Tab[/bold] switch panels · [bold]e[/bold] export"
+    )
+
+
+async def _collect_sbom_only(
+    host: Host,
+    db_path: Path,
+    sbom_base: Path,
+    log_cb: Any,
+) -> None:
+    """SSH into a single host and collect its SBOM only — no rescan, no risk analysis."""
+    from ..ssh_collector import RemoteCollector
+
+    collector = RemoteCollector()
+    raw = await collector.collect(host)
+    if not raw:
+        log_cb(f"[dim]SBOM:[/dim] {host.display_name} — SSH failed, cannot collect packages")
+        return
+
+    host_id = host.mac or host.ip
+    packages = collect_packages_from_raw(raw)
+    if not packages:
+        log_cb(
+            f"[dim]SBOM:[/dim] {host.display_name} — "
+            f"no packages found (dpkg/rpm/pip/snap/flatpak/docker all empty)"
+        )
+        return
+
+    collected_at = datetime.now()
+    sbom_path = write_sbom(
+        sbom_base, host_id, packages,
+        ip=host.ip,
+        hostname=host.hostname,
+        collected_at=collected_at,
+    )
+    writer = DB.open_writer(db_path)
+    try:
+        register_sbom_in_catalog(
+            writer, host_id, host.ip,
+            host.hostname, collected_at, sbom_path, len(packages),
+        )
+    finally:
+        writer.close()
+
+    log_cb(
+        f"[dim]SBOM:[/dim] {host.display_name} — "
+        f"{len(packages)} packages → {sbom_path.name}"
     )
 
 
