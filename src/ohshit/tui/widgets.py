@@ -121,6 +121,11 @@ class HostListPanel(Widget):
         if isinstance(item, HostListItem):
             self.post_message(self.HostSelected(item.host.ip))
 
+    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        item = event.item
+        if isinstance(item, HostListItem):
+            self.post_message(self.HostSelected(item.host.ip))
+
 
 # ---------------------------------------------------------------------------
 # HostDetailTab
@@ -142,7 +147,14 @@ class HostDetailTab(Widget):
 
     def update_host(self, host: Host | None) -> None:
         if host is None:
-            self.query_one("#detail-header", Label).update("Select a host")
+            self.query_one("#detail-header", Label).update(
+                "← Select a host from the list to see details"
+            )
+            self.query_one("#detail-os", Label).update("")
+            self.query_one("#detail-kernel", Label).update("")
+            self.query_one("#detail-mac", Label).update("")
+            self.query_one("#detail-ssh", Label).update("")
+            self.query_one("#ports-table", DataTable).clear(columns=False)
             return
 
         name = host.display_name
@@ -190,6 +202,10 @@ class FindingsTable(Widget):
         tbl = self.query_one("#findings-dt", DataTable)
         tbl.clear(columns=False)
         if host is None:
+            return
+        if not host.findings:
+            # Add a single info row so the table isn't just blank
+            tbl.add_row(Text("Info", style="white on blue"), "-", "No findings — host looks clean", "0")
             return
         for f in sorted(host.findings, key=lambda x: x.score, reverse=True):
             tbl.add_row(

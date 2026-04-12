@@ -86,7 +86,7 @@ class OhShitApp(App[None]):
 
     def on_mount(self) -> None:
         self.title = "Oh-Shit Network Security Dashboard"
-        self._log("Ready. Press [bold]r[/bold] to start a scan.")
+        self._log("Starting network scan... (press [bold]r[/bold] to re-scan at any time)")
         self.action_rescan_all()
 
     # ------------------------------------------------------------------
@@ -161,7 +161,8 @@ class OhShitApp(App[None]):
             self._log(
                 f"[bold]Scan complete.[/bold] "
                 f"Network risk: [{_sev_colour(result.network_risk_label)}]{net_label}[/] "
-                f"(score {net_score})"
+                f"(score {net_score})  |  "
+                f"Use [bold]↑↓[/bold] to browse hosts · [bold]Tab[/bold] to switch panels · [bold]e[/bold] to export"
             )
         except Exception as exc:
             self._log(f"[bold red]Scan failed:[/bold red] {exc}")
@@ -214,6 +215,10 @@ class OhShitApp(App[None]):
         if not self.scan_result:
             return
         await self.query_one("#host-panel", HostListPanel).update_hosts(self.scan_result)
+        # Auto-select the highest-risk host if nothing is selected yet
+        if not self.selected_ip and self.scan_result.hosts:
+            top = max(self.scan_result.hosts.values(), key=lambda h: h.risk_score)
+            self.selected_ip = top.ip
         if self.selected_ip and self.selected_ip in self.scan_result.hosts:
             await self._refresh_right_panel(self.scan_result.hosts[self.selected_ip])
 
