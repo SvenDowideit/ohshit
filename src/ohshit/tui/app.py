@@ -154,11 +154,17 @@ class OhShitApp(App[None]):
         # Load whatever is already in the DB immediately
         self._poll_db()
         self._log(f"Database: [bold]{self._db_path}[/bold]")
-        self._log("Starting network scan… press [bold]r[/bold] to re-scan")
         # Start periodic UI poll
         self.set_interval(_POLL_INTERVAL, self._check_for_updates)
-        # Launch initial scan
-        self.action_rescan_all()
+        # Auto-scan only if there are no known hosts yet
+        if not self._hosts:
+            self._log("No known hosts — starting network scan…")
+            self.action_rescan_all()
+        else:
+            self._log(
+                f"Loaded {len(self._hosts)} known host(s) from DB — "
+                f"press [bold]r[/bold] to scan"
+            )
 
     def _refresh_oui_cache(self) -> None:
         from ..oui_db import refresh_cache
