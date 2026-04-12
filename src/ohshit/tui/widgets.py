@@ -477,7 +477,7 @@ class SbomTab(Widget):
 
     def on_mount(self) -> None:
         tbl = self.query_one("#sbom-table", DataTable)
-        tbl.add_columns("Released", "Source", "Name", "Version", "Arch", "CVEs")
+        tbl.add_columns("CVEs", "Released", "Source", "Name", "Version", "Arch")
         tbl.cursor_type = "row"
 
     def update_sbom(
@@ -560,12 +560,12 @@ class SbomTab(Widget):
                 cve_text = Text("")
 
             tbl.add_row(
+                cve_text,
                 age_str,
                 pkg.get("source", ""),
                 pkg.get("name", ""),
                 pkg.get("version", ""),
                 pkg.get("arch", ""),
-                cve_text,
             )
 
 
