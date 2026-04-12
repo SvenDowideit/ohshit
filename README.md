@@ -119,7 +119,8 @@ device announcements:
 
 ### 4 — Risk scoring
 
-Each collected data point is evaluated against 14 security rules:
+Each collected data point is evaluated against security rules. Vulnerability
+data (when available) also contributes to the score:
 
 | Rule | Severity | Score |
 |------|----------|------:|
@@ -128,20 +129,29 @@ Each collected data point is evaluated against 14 security rules:
 | Accounts with empty passwords | Critical | 10 |
 | Telnet (port 23) open | Critical | 10 |
 | Docker socket / daemon port exposed | Critical | 10 |
+| CVE in CISA KEV catalog (actively exploited) | Critical | 10 |
+| 50+ CVEs in installed packages | Critical | 10 |
 | SSH `PasswordAuthentication yes` | High | 5 |
 | SSH `PermitRootLogin yes` | High | 5 |
 | Kernel update available | High | 5 |
 | Privileged Docker containers | High | 5 |
 | FTP (port 21) open | High | 5 |
+| 21–49 CVEs in installed packages | High | 5 |
+| High/Critical severity CVEs present | High | 5 |
 | SSH `X11Forwarding yes` | Medium | 2 |
 | >10 outdated packages | Medium | 2 |
 | HTTP without HTTPS | Medium | 2 |
 | Unexpected service on `0.0.0.0` | Medium | 2 |
+| 6–20 CVEs in installed packages | Medium | 2 |
 | 1–10 outdated packages | Low | 1 |
+| 1–5 CVEs in installed packages | Low | 1 |
 
 **Per-host score** = sum of finding scores.  
 **Risk label:** Critical ≥ 30 · High ≥ 15 · Medium ≥ 8 · Low > 0 · Info = 0  
 **Network score** = max(host scores) + mean(host scores)
+
+Vulnerability findings are added automatically when vuln data is available
+(loaded from cache on startup, or freshly queried with `v`).
 
 ### 5 — SBOM collection
 
@@ -190,9 +200,9 @@ first run (`INSTALL ducklake`).
 
 ### 6 — Vulnerability matching
 
-After SBOM collection, press `v` to query public vulnerability databases for
-every package on the selected host.  Results are cached locally and shown
-immediately on subsequent launches.
+After SBOM collection, vulnerability data is fetched automatically in the
+background on startup and kept fresh with a daily refresh cycle.  Press `v`
+to force an immediate re-query for the selected host.
 
 #### Sources
 
@@ -215,19 +225,28 @@ results.
 | `flatpak` | — (not indexed) |
 | `docker` | — (image tags not indexed) |
 
-#### Cache
+#### Cache and background refresh
 
-Vulnerability data is cached in `~/.cache/ohshit/vuln.duckdb` — separate from
-the per-project `ohshit.db` so it is shared across runs and reused when you
-re-scan different subnets.
+Per-host vulnerability matches are persisted in `ohshit.db` (`vuln_cache`
+table) so they survive restarts without re-querying the network.
+
+On startup the tool:
+1. Loads previously cached matches from DB and applies them immediately
+2. Identifies any host whose cache is missing or older than 24 hours
+3. Quietly refreshes those hosts in a background thread, logging each result
+   to the log panel
+
+The raw advisory data (advisory IDs, CVSS scores, summaries) is cached
+separately in `~/.cache/ohshit/vuln.duckdb`, shared across all projects.
 
 #### Display
 
-- **SBOM tab** — adds a `CVEs` column showing the count of matching advisories
-  per package (shown in red when non-zero).
+- **SBOM tab** — `CVEs` column (first column, shown in red when non-zero)
+  shows the count of matching advisories per package. Packages are sorted by:
+  KEV hits first → worst CVE severity → CVE count → newest release date.
 - **Vulnerabilities tab** — full advisory table with advisory ID, a `★` badge
   for entries in the CISA KEV catalog (actively exploited), severity, CVSS
-  score, affected package, and summary text.  Packages with the most CVEs are
+  score, affected package, and summary text. Packages with the most CVEs are
   listed first.
 
 ### 7 — Dashboard
@@ -239,9 +258,10 @@ The Textual TUI refreshes as data arrives:
   - *Host Details* — IP, MAC, OS, kernel, vendor, IoT identifiers, open ports
   - *Findings* — table of all findings sorted by severity
   - *Remediation* — copy-pasteable fix commands for each finding
-  - *SBOM* — package inventory for the selected host, showing release age, source, name,
-    version, architecture, and CVE count; header shows collection timestamp and
-    total package count
+  - *SBOM* — package inventory for the selected host. First column shows CVE
+    count (red if non-zero). Sorted by: KEV hits → worst CVE severity → CVE
+    count → newest release date. Header shows collection timestamp, package
+    count, and total CVE count.
   - *Vulnerabilities* — CVE advisory list for the selected host's packages,
     with KEV active-exploitation badge (★), severity, CVSS score, and summary
 - **Bottom** — scan progress bar and live log
@@ -252,8 +272,8 @@ The Textual TUI refreshes as data arrives:
 |-----|--------|
 | `r` | Re-scan all hosts |
 | `s` | Re-scan the selected host |
-| `b` | Force SBOM collection for the selected host (bypasses the 24 h age check) |
-| `v` | Query vulnerability databases for the selected host's SBOM packages |
+| `b` | Collect SBOM for the selected host only (SSH only, no full rescan; bypasses 24 h age check) |
+| `v` | Force vulnerability refresh for the selected host (OSV + CISA KEV) |
 | `e` | Export Markdown report to `~/network-security-report-<timestamp>.md` |
 | `q` | Quit |
 
@@ -272,16 +292,22 @@ ohshit [--no-ssh] [--subnet CIDR] [--strict-host-keys] [--ha-token TOKEN] [--db 
 ## Data persistence
 
 All scan data is stored in a DuckDB database (`ohshit.db` by default) and
-persists across runs. Hosts are never deleted — offline hosts are marked
-**Unreachable** and remain in the list. Previously seen MAC addresses are
-tracked in a separate append-only history table to detect hardware repurposing.
+persists across runs. The tool loads existing host data on startup and only
+auto-scans if no hosts are known yet — otherwise it waits for `r`.
+
+Hosts are never deleted — offline hosts are marked **Unreachable** and remain
+in the list. Previously seen MAC addresses are tracked in a separate
+append-only history table to detect hardware repurposing.
 
 SBOM databases accumulate in the `sbom/` directory next to the main database
 and are never automatically removed.
 
-Vulnerability data is cached in `~/.cache/ohshit/vuln.duckdb` and is shared
-across all projects and runs.  It is never automatically purged — press `v`
-to refresh it on demand.
+Per-host vulnerability matches are stored in `ohshit.db` (`vuln_cache` table)
+and loaded on every startup. Stale entries (>24 h) are refreshed automatically
+in the background.
+
+Raw advisory data (CVE details, CVSS scores) is cached in
+`~/.cache/ohshit/vuln.duckdb`, shared across all projects and runs.
 
 ## Project layout
 
@@ -343,5 +369,6 @@ which the UI thread reads without locking.
   host. Restrict access to this directory appropriately.
 - Vulnerability queries are sent to `api.osv.dev` (Google) and
   `www.cisa.gov` — the package names and versions of every installed package
-  on your hosts are transmitted. Do not use `v` on air-gapped networks or
-  where package inventory must remain confidential.
+  on your hosts are transmitted. This happens automatically in the background
+  for any host with a stale or missing vuln cache. Do not run on air-gapped
+  networks or where package inventory must remain confidential.
