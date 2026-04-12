@@ -170,7 +170,9 @@ class OhShitApp(App[None]):
                 f"Use [bold]↑↓[/bold] to browse hosts · [bold]Tab[/bold] to switch panels · [bold]e[/bold] to export"
             )
         except Exception as exc:
+            import traceback
             self._log(f"[bold red]Scan failed:[/bold red] {exc}")
+            self._log(f"[dim red]{traceback.format_exc()[-300:]}[/dim red]")
             self._set_progress("Scan failed", 0)
         finally:
             self.scan_running = False
@@ -204,13 +206,19 @@ class OhShitApp(App[None]):
         self._set_progress(f"SSH: {step}", 60 + int(pct * 0.35))
 
     def _set_progress(self, step: str, pct: int) -> None:
-        bar = self.query_one("#scan-progress", ScanProgressBar)
-        bar.step_name = step
-        bar.progress = float(pct)
+        try:
+            bar = self.query_one("#scan-progress", ScanProgressBar)
+            bar.step_name = step
+            bar.progress = float(pct)
+        except Exception:
+            pass
 
     def _log(self, msg: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
-        self.query_one("#log-feed", LogFeed).write(f"[dim]{ts}[/dim] {msg}")
+        try:
+            self.query_one("#log-feed", LogFeed).write(f"[dim]{ts}[/dim] {msg}")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Panel refresh helpers

@@ -24,18 +24,22 @@ Screen {
     padding: 0 1;
 }
 
-/* Right panel must fill its vertical space so TabbedContent can too */
+/* Right panel must fill its vertical space */
 #right-panel {
     width: 1fr;
     height: 100%;
 }
 
-/* TabbedContent defaults to height:auto — override so it fills the panel */
+/* TabbedContent AND ContentSwitcher both default to height:auto — override both */
 #detail-tabs {
-    height: 100%;
+    height: 1fr;
 }
 
-/* TabPane must also fill so inner widgets get a real height */
+ContentSwitcher {
+    height: 1fr;
+}
+
+/* TabPane fills ContentSwitcher */
 TabPane {
     height: 100%;
     padding: 0;
