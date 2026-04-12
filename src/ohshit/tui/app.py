@@ -125,6 +125,8 @@ class OhShitApp(App[None]):
 
     def on_mount(self) -> None:
         self.title = "Oh-Shit Network Security Dashboard"
+        # Refresh OUI cache in background (non-blocking; falls back to mini-table)
+        threading.Thread(target=self._refresh_oui_cache, daemon=True, name="oui-cache").start()
         # Open reader connection
         self._reader = DB.open_reader(self._db_path)
         # Load whatever is already in the DB immediately
@@ -135,6 +137,11 @@ class OhShitApp(App[None]):
         self.set_interval(_POLL_INTERVAL, self._check_for_updates)
         # Launch initial scan
         self.action_rescan_all()
+
+    def _refresh_oui_cache(self) -> None:
+        from ..oui_db import refresh_cache
+        if refresh_cache():
+            self._thread_safe_log("[dim]OUI vendor database ready.[/dim]")
 
     def on_unmount(self) -> None:
         if self._reader:

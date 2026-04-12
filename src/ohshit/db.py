@@ -97,6 +97,7 @@ _SCHEMA_STATEMENTS = [
     ip                  TEXT PRIMARY KEY,
     vendor              TEXT,
     device_type         TEXT,
+    mac_permanence      TEXT,
     mdns_names_json     TEXT NOT NULL DEFAULT '[]',
     mdns_services_json  TEXT NOT NULL DEFAULT '[]',
     upnp_friendly_name  TEXT,
@@ -117,10 +118,10 @@ _SCHEMA_STATEMENTS = [
 )""",
 ]
 
-# Migrations: add columns that may not exist in older DB files.
-# Each is (table, column, definition) — applied with ALTER TABLE IF NOT EXISTS.
+# Migrations: ALTER TABLE statements to add columns to existing DB files.
+# Each tuple is (table, column, sql_type_and_default).
 _MIGRATIONS = [
-    # (no migrations yet — placeholder for future schema changes)
+    ("iot_info", "mac_permanence", "TEXT"),
 ]
 
 
@@ -128,7 +129,12 @@ def _ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
     """Create any missing tables and apply pending migrations."""
     for stmt in _SCHEMA_STATEMENTS:
         con.execute(stmt)
-    # Future: apply _MIGRATIONS here with ALTER TABLE ... ADD COLUMN IF NOT EXISTS
+    # Apply migrations: add columns that may not exist in older DB files.
+    for table, column, sql_type in _MIGRATIONS:
+        try:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+        except Exception:
+            pass  # Column already exists — DuckDB raises on duplicate ADD COLUMN
 
 
 def open_writer(path: Path) -> duckdb.DuckDBPyConnection:
@@ -238,13 +244,15 @@ def replace_findings(con: duckdb.DuckDBPyConnection, host: Host) -> None:
 def upsert_iot(con: duckdb.DuckDBPyConnection, ip: str, iot: IotInfo) -> None:
     con.execute("""
         INSERT INTO iot_info
-            (ip, vendor, device_type, mdns_names_json, mdns_services_json,
+            (ip, vendor, device_type, mac_permanence,
+             mdns_names_json, mdns_services_json,
              upnp_friendly_name, upnp_model, ha_entity_id,
              mqtt_topics_json, banner_grabs_json, detection_methods_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (ip) DO UPDATE SET
             vendor              = COALESCE(excluded.vendor, iot_info.vendor),
             device_type         = COALESCE(excluded.device_type, iot_info.device_type),
+            mac_permanence      = COALESCE(excluded.mac_permanence, iot_info.mac_permanence),
             mdns_names_json     = excluded.mdns_names_json,
             mdns_services_json  = excluded.mdns_services_json,
             upnp_friendly_name  = COALESCE(excluded.upnp_friendly_name, iot_info.upnp_friendly_name),
@@ -255,7 +263,7 @@ def upsert_iot(con: duckdb.DuckDBPyConnection, ip: str, iot: IotInfo) -> None:
             detection_methods_json = excluded.detection_methods_json
     """, [
         ip,
-        iot.vendor, iot.device_type,
+        iot.vendor, iot.device_type, iot.mac_permanence,
         json.dumps(iot.mdns_names), json.dumps(iot.mdns_services),
         iot.upnp_friendly_name, iot.upnp_model, iot.ha_entity_id,
         json.dumps(iot.mqtt_topics),
@@ -360,18 +368,20 @@ def load_all_hosts(con: duckdb.DuckDBPyConnection) -> dict[str, Host]:
 
     # Bulk load IoT info
     iot_rows = con.execute("""
-        SELECT ip, vendor, device_type, mdns_names_json, mdns_services_json,
+        SELECT ip, vendor, device_type, mac_permanence,
+               mdns_names_json, mdns_services_json,
                upnp_friendly_name, upnp_model, ha_entity_id,
                mqtt_topics_json, banner_grabs_json, detection_methods_json
         FROM iot_info
     """).fetchall()
-    for (ip, vendor, device_type, mdns_names_json, mdns_services_json,
+    for (ip, vendor, device_type, mac_permanence, mdns_names_json, mdns_services_json,
          upnp_friendly_name, upnp_model, ha_entity_id,
          mqtt_topics_json, banner_grabs_json, detection_methods_json) in iot_rows:
         if ip in hosts:
             hosts[ip].iot_info = IotInfo(
                 vendor=vendor,
                 device_type=device_type,
+                mac_permanence=mac_permanence,
                 mdns_names=json.loads(mdns_names_json or "[]"),
                 mdns_services=json.loads(mdns_services_json or "[]"),
                 upnp_friendly_name=upnp_friendly_name,

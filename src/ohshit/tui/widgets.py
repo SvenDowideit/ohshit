@@ -239,16 +239,36 @@ class HostDetailTab(Widget):
             ssh_info += f"  ({host.ssh_error})"
         self.query_one("#detail-ssh", Label).update(f"SSH: {ssh_info}")
 
-        # IoT vendor / device type
+        # IoT vendor / device type + MAC permanence
         iot = host.iot_info
         vendor_parts = []
         if iot.vendor:
             vendor_parts.append(iot.vendor)
         if iot.device_type:
             vendor_parts.append(f"({iot.device_type})")
-        self.query_one("#detail-vendor", Label).update(
-            f"Vendor: {' '.join(vendor_parts)}" if vendor_parts else ""
-        )
+        if iot.mac_permanence:
+            from ..oui_db import PERMANENCE_LABELS, PERMANENCE_VIRTUAL, PERMANENCE_EXTERNAL, PERMANENCE_REMOVABLE
+            perm_label = PERMANENCE_LABELS.get(iot.mac_permanence, iot.mac_permanence)
+            # Highlight removable/external/virtual with a visual cue
+            if iot.mac_permanence in (PERMANENCE_VIRTUAL, PERMANENCE_EXTERNAL, PERMANENCE_REMOVABLE):
+                vendor_parts.append(Text(f"[{perm_label}]", style="bold yellow"))
+            else:
+                vendor_parts.append(f"[{perm_label}]")
+
+        if vendor_parts:
+            # vendor_parts may mix str and Text — build a combined Text
+            line = Text()
+            line.append("Vendor: ")
+            for i, part in enumerate(vendor_parts):
+                if i:
+                    line.append("  ")
+                if isinstance(part, Text):
+                    line.append_text(part)
+                else:
+                    line.append(part)
+            self.query_one("#detail-vendor", Label).update(line)
+        else:
+            self.query_one("#detail-vendor", Label).update("")
 
         # IoT identifiers: mDNS names, UPnP, HA entity, detection methods
         iot_parts: list[str] = []

@@ -5,7 +5,7 @@ without modifying anything on target devices.
 
 Detectors
 ---------
-1. MAC OUI lookup — vendor from first 3 octets of MAC (bundled prefix table).
+1. MAC OUI lookup — vendor + permanence from IEEE registry (see oui_db.py).
 2. mDNS sniff     — read _services._dns-sd._udp.local for 2 s.
 3. SSDP / UPnP    — send one M-SEARCH, collect responses for 3 s.
 4. Banner grabs   — TCP connect on common IoT ports, read first 512 bytes.
@@ -15,7 +15,6 @@ Detectors
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 import socket
 import struct
@@ -24,67 +23,11 @@ from typing import Any
 import aiohttp
 
 from .models import IotInfo
+from .oui_db import lookup_oui
 
 # ---------------------------------------------------------------------------
-# 1. MAC OUI lookup
+# Common IoT ports for banner grabbing
 # ---------------------------------------------------------------------------
-
-# Abbreviated table of the most common IoT/consumer OUIs.
-# Format: lowercase first-3-octet prefix → (vendor, device_type hint)
-_OUI: dict[str, tuple[str, str | None]] = {
-    # Networking / Routers
-    "e4:38:83": ("ASUS", "Router"),
-    "b0:be:76": ("ASUS", "Router"),
-    "14:eb:b6": ("Ubiquiti", "AP/Router"),
-    "fc:ec:da": ("Ubiquiti", "AP/Router"),
-    "00:27:22": ("Ubiquiti", "AP/Router"),
-    "b4:fb:e4": ("Netgear", "Router"),
-    "c0:3f:d5": ("Netgear", "Router"),
-    "00:26:f2": ("Netgear", "Router"),
-    "f8:1a:67": ("TP-Link", "Router"),
-    "98:de:d0": ("TP-Link", "Router"),
-    "50:c7:bf": ("TP-Link", "Router"),
-    "28:d2:44": ("Synology", "NAS"),
-    "00:11:32": ("Synology", "NAS"),
-    # Smart home hubs
-    "00:17:88": ("Philips", "Hue Hub"),
-    "ec:b5:fa": ("Philips", "Hue"),
-    "18:b4:30": ("Nest", "Thermostat/Camera"),
-    "64:16:66": ("Nest", "Hub"),
-    "a4:c1:38": ("Sonos", "Speaker"),
-    "5c:aa:fd": ("Sonos", "Speaker"),
-    "b8:e9:37": ("Apple", "TV/HomePod"),
-    "3c:22:fb": ("Apple", "TV"),
-    "f0:b4:29": ("Apple", "TV"),
-    "f4:f1:5a": ("Google", "Home/Chromecast"),
-    "54:60:09": ("Google", "Chromecast"),
-    "6c:ad:f8": ("Google", "Home"),
-    # Smart TVs
-    "8c:77:12": ("Samsung", "Smart TV"),
-    "f8:04:2e": ("Samsung", "Smart TV"),
-    "a0:b4:a5": ("LG Electronics", "Smart TV"),
-    "64:9a:be": ("LG Electronics", "TV"),
-    # IoT / sensors
-    "68:c6:3a": ("Amazon", "Echo/Fire"),
-    "fc:65:de": ("Amazon", "Echo"),
-    "0c:47:c9": ("Amazon", "Kindle/Fire"),
-    "b0:6e:bf": ("IKEA", "Tradfri Hub"),
-    "ac:23:3f": ("Xiaomi", "IoT Device"),
-    "f4:84:8d": ("Xiaomi", "Hub"),
-    "10:6f:3f": ("Tuya/Smart Life", "IoT Device"),
-    "7c:df:a1": ("ESP32/ESP8266", "IoT Device"),
-    "e8:db:84": ("ESP32/ESP8266", "IoT Device"),
-    "ec:fa:bc": ("Espressif", "IoT Device"),
-    # Printers
-    "00:1e:8f": ("HP", "Printer"),
-    "3c:d9:2b": ("HP", "Printer"),
-    "00:1b:a9": ("Brother", "Printer"),
-    # Raspberry Pi / SBCs
-    "dc:a6:32": ("Raspberry Pi", "SBC"),
-    "b8:27:eb": ("Raspberry Pi", "SBC"),
-    "e4:5f:01": ("Raspberry Pi", "SBC"),
-    "d8:3a:dd": ("Raspberry Pi", "SBC"),
-}
 
 # Common IoT ports for banner grabbing
 _IOT_PORTS: list[tuple[int, str]] = [
@@ -435,12 +378,14 @@ async def detect_iot(
     """Run all passive IoT detectors for one host and return merged IotInfo."""
     info = IotInfo()
 
-    # OUI lookup (instant)
-    vendor, device_type = lookup_oui(mac)
-    if vendor:
-        info.vendor = vendor
-        info.device_type = device_type
+    # OUI lookup (instant) — uses IEEE registry if cached, else mini-table
+    oui = lookup_oui(mac)
+    if oui:
+        info.vendor = oui.vendor
+        info.mac_permanence = oui.permanence
         info.detection_methods.append("OUI")
+        # device_type is not in the full IEEE DB; only the mini-table has it.
+        # We leave it to banner/SSDP/mDNS to fill in for the full-DB case.
 
     # Banner grabs (skip SSH port 22 on SSH-accessible hosts to reduce noise)
     skip_ports = [22] if is_ssh_accessible else []

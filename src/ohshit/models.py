@@ -74,6 +74,7 @@ class IotInfo:
     """Passively gathered IoT identification data."""
     vendor: str | None = None          # from MAC OUI
     device_type: str | None = None     # "Smart TV", "Router", "Hub", etc.
+    mac_permanence: str | None = None  # PERMANENCE_* constant from oui_db
     mdns_names: list[str] = field(default_factory=list)   # from mDNS
     mdns_services: list[str] = field(default_factory=list)
     upnp_friendly_name: str | None = None
