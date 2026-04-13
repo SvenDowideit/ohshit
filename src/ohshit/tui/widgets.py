@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from rich.text import Text
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.message import Message
 from textual.reactive import reactive
 from textual.widget import Widget
@@ -17,6 +18,7 @@ from textual.widgets import (
     Static,
     TabbedContent,
     TabPane,
+    TextArea,
 )
 from textual.containers import Horizontal, VerticalScroll
 
@@ -578,16 +580,48 @@ def _is_shell_cmd(step: str) -> bool:
     return False
 
 
+class _CmdBlock(TextArea):
+    """Read-only TextArea for shell commands — mouse-selectable, y/c to copy."""
+
+    BINDINGS = [Binding("y,c", "copy_selection", "Copy", show=False)]
+
+    def on_mount(self) -> None:
+        self.read_only = True
+
+    def action_copy_selection(self) -> None:
+        text = self.selected_text or self.text
+        if text:
+            self.app.copy_to_clipboard(text)
+            self.app.notify("Copied to clipboard", timeout=2)
+
+
 class RemediationPanel(Widget):
+    BINDINGS = [("y", "yank_commands", "Copy commands")]
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self._current_host: Host | None = None
+
     def compose(self) -> ComposeResult:
+        yield Label("", id="remed-hint")
         yield VerticalScroll(id="remed-scroll")
 
     async def update_host(self, host: Host | None) -> None:
+        self._current_host = host
+        hint = self.query_one("#remed-hint", Label)
         scroll = self.query_one("#remed-scroll", VerticalScroll)
         await scroll.remove_children()
         if host is None or not host.findings:
+            hint.update("")
             scroll.mount(Label("No findings."))
             return
+
+        has_cmds = any(
+            _is_shell_cmd(step)
+            for f in host.findings
+            for step in f.remediation
+        )
+        hint.update("  Select text then press [bold]y[/bold] or [bold]c[/bold] to copy  " if has_cmds else "")
 
         for f in sorted(host.findings, key=lambda x: x.score, reverse=True):
             header = Text(
@@ -597,19 +631,52 @@ class RemediationPanel(Widget):
             scroll.mount(Static(header, classes="remed-title"))
             scroll.mount(Static(f.description, classes="remed-desc"))
             if f.remediation:
+                cmd_buf: list[str] = []
+
+                def _flush_cmds(buf: list[str]) -> None:
+                    if not buf:
+                        return
+                    block = _CmdBlock(
+                        "\n".join(buf),
+                        language="bash",
+                        classes="remed-cmd-block",
+                    )
+                    scroll.mount(block)
+
                 for step in f.remediation:
                     if step == "":
+                        _flush_cmds(cmd_buf)
+                        cmd_buf = []
                         scroll.mount(Static("", classes="remed-blank"))
                     elif _is_shell_cmd(step):
-                        scroll.mount(Static(f"  $ {step}", classes="remed-step"))
+                        cmd_buf.append(step)
                     else:
+                        _flush_cmds(cmd_buf)
+                        cmd_buf = []
                         scroll.mount(Static(f"  {step}", classes="remed-note"))
+                _flush_cmds(cmd_buf)
+
             if f.evidence:
                 scroll.mount(Static(
                     Text("  Evidence: ", style="dim") + Text(f.evidence[:200], style="dim italic"),
                     classes="remed-evidence",
                 ))
             scroll.mount(Static("─" * 60, classes="remed-sep"))
+
+    def action_yank_commands(self) -> None:
+        host = self._current_host
+        if host is None:
+            return
+        lines: list[str] = []
+        for f in sorted(host.findings, key=lambda x: x.score, reverse=True):
+            cmds = [s for s in f.remediation if _is_shell_cmd(s)]
+            if cmds:
+                lines.append(f"# {f.title}")
+                lines.extend(cmds)
+                lines.append("")
+        if lines:
+            self.app.copy_to_clipboard("\n".join(lines))
+            self.app.notify("Commands copied to clipboard", timeout=2)
 
 
 # ---------------------------------------------------------------------------

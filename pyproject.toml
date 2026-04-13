@@ -15,6 +15,7 @@ dependencies = [
     "rich>=13.7.0",
     "duckdb>=1.1.0",
     "pytz>=2026.1.post1",
+    "pyperclip>=1.11.0",
 ]
 
 [project.scripts]

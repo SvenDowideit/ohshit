@@ -123,6 +123,35 @@ class OhShitApp(App[None]):
     # Layout
     # ------------------------------------------------------------------
 
+    def copy_to_clipboard(self, text: str) -> None:
+        """Copy text to clipboard via pyperclip (broad compatibility) and OSC 52 (SSH/remote)."""
+        import subprocess, shutil
+        # pyperclip: works on GNOME Terminal, Konsole, and most local terminals
+        try:
+            import pyperclip
+            pyperclip.copy(text)
+        except Exception:
+            # Fall back to direct subprocess calls if pyperclip can't find a mechanism
+            if shutil.which("wl-copy"):
+                try:
+                    subprocess.run(["wl-copy"], input=text.encode(), check=True, timeout=2)
+                except Exception:
+                    pass
+            elif shutil.which("xclip"):
+                try:
+                    subprocess.run(["xclip", "-selection", "clipboard"],
+                                   input=text.encode(), check=True, timeout=2)
+                except Exception:
+                    pass
+            elif shutil.which("xsel"):
+                try:
+                    subprocess.run(["xsel", "--clipboard", "--input"],
+                                   input=text.encode(), check=True, timeout=2)
+                except Exception:
+                    pass
+        # Also send OSC 52 — works over SSH and in kitty/alacritty/wezterm/ghostty
+        super().copy_to_clipboard(text)
+
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal(id="main-body"):

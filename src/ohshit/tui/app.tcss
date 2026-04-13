@@ -90,7 +90,14 @@ RemediationPanel {
 }
 
 RemediationPanel > VerticalScroll {
-    height: 100%;
+    height: 1fr;
+}
+
+#remed-hint {
+    height: auto;
+    color: $text-muted;
+    text-style: dim;
+    padding: 0 1;
 }
 
 #bottom-panel {
@@ -188,9 +195,11 @@ HostListItem > Horizontal {
     padding: 0 2;
 }
 
-.remed-step {
-    color: $success;
-    padding: 0 2;
+/* Selectable command block — TextArea with bash highlighting */
+.remed-cmd-block {
+    margin: 0 2 0 2;
+    height: auto;
+    max-height: 20;
 }
 
 .remed-note {
