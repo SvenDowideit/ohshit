@@ -120,18 +120,45 @@ class HostListItem(ListItem):
                 self.host.display_name,
                 classes="host-name",
             )
+            eol_label, eol_class = self._eol_badge(self.host)
+            if eol_label:
+                lbl = Label(eol_label, classes=f"eol-badge {eol_class}")
+            else:
+                lbl = Label("", classes="eol-badge")
+            yield lbl
             yield Label(
                 self.host.state.value,
                 classes="host-state",
             )
 
+    @staticmethod
+    def _eol_badge(host: Host) -> tuple[str, str]:
+        if not host.os_release:
+            return ("", "")
+        try:
+            from ..distro_eol import get_eol_info, eol_badge_text
+            info = get_eol_info(host.os_release)
+            if info is None:
+                return ("", "")
+            return eol_badge_text(info)
+        except Exception:
+            return ("", "")
+
     def refresh_host(self, host: Host) -> None:
-        """Update badge, name, and state label in-place without re-mounting."""
+        """Update badge, name, EOL indicator and state label in-place without re-mounting."""
         self.host = host
         try:
             self.query_one(NetworkRiskBadge).update_severity(host.risk_label)
             self.query_one(".host-name", Label).update(host.display_name)
             self.query_one(".host-state", Label).update(host.state.value)
+            eol_label, eol_class = self._eol_badge(host)
+            eol_widget = self.query_one(".eol-badge", Label)
+            eol_widget.update(eol_label)
+            # Update CSS class
+            for cls in ("eol-badge-critical", "eol-badge-high", "eol-badge-medium"):
+                eol_widget.remove_class(cls)
+            if eol_class:
+                eol_widget.add_class(eol_class)
         except Exception:
             pass
 
@@ -226,6 +253,7 @@ class HostDetailTab(Widget):
     def compose(self) -> ComposeResult:
         yield Label("", id="detail-header")
         yield Label("", id="detail-os")
+        yield Label("", id="detail-eol")
         yield Label("", id="detail-kernel")
         yield Label("", id="detail-mac")
         yield Label("", id="detail-ssh")
@@ -252,7 +280,7 @@ class HostDetailTab(Widget):
             self.query_one("#detail-header", Label).update(
                 "← Select a host from the list to see details"
             )
-            for wid in ("detail-os", "detail-kernel", "detail-mac", "detail-ssh",
+            for wid in ("detail-os", "detail-eol", "detail-kernel", "detail-mac", "detail-ssh",
                         "detail-seen", "detail-vendor", "detail-iot", "detail-repurpose",
                         "detail-esphome", "detail-vuln-summary"):
                 self.query_one(f"#{wid}", Label).update("")
@@ -272,6 +300,43 @@ class HostDetailTab(Widget):
             if pretty:
                 os_info = pretty + (f"  [{os_info}]" if os_info else "")
         self.query_one("#detail-os", Label).update(f"OS: {os_info or 'unknown'}")
+
+        # EOL information
+        eol_label = self.query_one("#detail-eol", Label)
+        if host.os_release:
+            try:
+                from ..distro_eol import get_eol_info
+                eol_info = get_eol_info(host.os_release)
+                if eol_info:
+                    days = eol_info.effective_days_remaining
+                    eol_date_str = eol_info.effective_eol.strftime("%Y-%m-%d")
+                    support = eol_info.support_type
+                    if days < 0:
+                        style = "bold white on red"
+                        status = f"END OF LIFE since {eol_date_str} ({abs(days)} days ago)"
+                    elif days < 90:
+                        style = "bold white on red"
+                        status = f"EOL in {days} days ({eol_date_str})"
+                    elif days < 180:
+                        style = "bold black on yellow"
+                        status = f"EOL in {days} days ({eol_date_str})"
+                    elif days < 365:
+                        style = "black on dark_orange3"
+                        status = f"EOL in ~{days // 30} months ({eol_date_str})"
+                    else:
+                        style = "dim"
+                        status = f"Supported until {eol_date_str} ({days // 30} months)"
+                    upgrade = f"  →  upgrade to {eol_info.successor}" if eol_info.successor and days < 365 else ""
+                    eol_label.update(
+                        Text(f"  [{support}] {status}{upgrade}", style=style)
+                    )
+                else:
+                    eol_label.update("")
+            except Exception:
+                eol_label.update("")
+        else:
+            eol_label.update("")
+
         self.query_one("#detail-kernel", Label).update(f"Kernel: {host.kernel_version or 'unknown'}")
         self.query_one("#detail-mac", Label).update(f"MAC: {host.mac or 'unknown'}  |  IP: {host.ip}")
 
@@ -472,6 +537,24 @@ class FindingsTable(Widget):
 # RemediationPanel
 # ---------------------------------------------------------------------------
 
+_SHELL_PREFIXES = (
+    "sudo ", "apt ", "dnf ", "yum ", "apk ", "zypper ", "pacman ",
+    "systemctl ", "sed ", "chmod ", "chown ", "docker ",
+    "do-release-upgrade", "leapp ", "snap ",
+)
+
+
+def _is_shell_cmd(step: str) -> bool:
+    """True if a remediation step looks like a shell command rather than prose."""
+    s = step.strip()
+    if s.startswith("#"):
+        return True  # shell comment — render as code
+    for prefix in _SHELL_PREFIXES:
+        if s.startswith(prefix):
+            return True
+    return False
+
+
 class RemediationPanel(Widget):
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="remed-scroll")
@@ -492,7 +575,17 @@ class RemediationPanel(Widget):
             scroll.mount(Static(f.description, classes="remed-desc"))
             if f.remediation:
                 for step in f.remediation:
-                    scroll.mount(Static(f"  $ {step}", classes="remed-step"))
+                    if step == "":
+                        scroll.mount(Static("", classes="remed-blank"))
+                    elif _is_shell_cmd(step):
+                        scroll.mount(Static(f"  $ {step}", classes="remed-step"))
+                    else:
+                        scroll.mount(Static(f"  {step}", classes="remed-note"))
+            if f.evidence:
+                scroll.mount(Static(
+                    Text("  Evidence: ", style="dim") + Text(f.evidence[:200], style="dim italic"),
+                    classes="remed-evidence",
+                ))
             scroll.mount(Static("─" * 60, classes="remed-sep"))
 
 

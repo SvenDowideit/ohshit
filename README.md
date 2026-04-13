@@ -136,6 +136,8 @@ data (when available) also contributes to the score:
 | Docker socket / daemon port exposed | Critical | 10 |
 | CVE in CISA KEV catalog (actively exploited) | Critical | 10 |
 | 50+ CVEs in installed packages | Critical | 10 |
+| OS is end-of-life | Critical | 10 |
+| OS end-of-life within 90 days | Critical | 10 |
 | SSH `PasswordAuthentication yes` | High | 5 |
 | SSH `PermitRootLogin yes` | High | 5 |
 | Kernel update available | High | 5 |
@@ -143,11 +145,13 @@ data (when available) also contributes to the score:
 | FTP (port 21) open | High | 5 |
 | 21–49 CVEs in installed packages | High | 5 |
 | High/Critical severity CVEs present | High | 5 |
+| OS end-of-life within 6 months | High | 5 |
 | SSH `X11Forwarding yes` | Medium | 2 |
 | >10 outdated packages | Medium | 2 |
 | HTTP without HTTPS | Medium | 2 |
 | Unexpected service on `0.0.0.0` | Medium | 2 |
 | 6–20 CVEs in installed packages | Medium | 2 |
+| OS end-of-life within a year | Medium | 2 |
 | 1–10 outdated packages | Low | 1 |
 | 1–5 CVEs in installed packages | Low | 1 |
 
@@ -265,11 +269,20 @@ The Textual TUI refreshes as data arrives:
 
 - **Left panel** — host list sorted by risk score, with coloured severity badges.
   The machine running oh-shit is labelled **Local** instead of SSH OK/Failed.
+  Hosts with an OS approaching or past end-of-life show a coloured **EOL** badge:
+  red `EOL` / `EOL<90d` (past or imminent), yellow `EOL<6m`, orange `EOL<1y`.
 - **Right panel (tabbed)**
   - *Host Details* — IP, MAC, OS, kernel, vendor, IoT identifiers, CVE summary
-    (total count, severity breakdown, KEV/ransomware indicators), and open ports
+    (total count, severity breakdown, KEV/ransomware indicators), and open ports.
+    If the OS version is known, an EOL status line is shown below the OS name:
+    support type, end-of-life date, days remaining, and recommended upgrade target.
+    Colour-coded red (EOL/imminent), yellow (<6 months), orange (<1 year), dim (in support).
   - *Findings* — table of all findings sorted by severity
-  - *Remediation* — copy-pasteable fix commands for each finding
+  - *Remediation* — fix instructions for each finding. Shell commands are shown
+    with a `$` prefix in green; explanatory notes are shown in muted text without
+    a prefix. All commands are tailored to the detected distribution and package
+    manager (apt/dnf/yum/apk/zypper). OS end-of-life findings include step-by-step
+    major-version upgrade instructions specific to the installed distro.
   - *SBOM* — package inventory for the selected host. First two columns are
     `Risk` (coloured badge: `★KEV` / `CRIT` / `HIGH` / `MED` / `LOW`) and
     `CVEs` (count, red if non-zero). Sorted by: KEV hits → worst CVE severity →
@@ -334,7 +347,8 @@ src/ohshit/
   models.py          Dataclasses: Host, Finding, PortInfo, IotInfo, ScanResult, enums
   discovery.py       ARP / ping sweep / nmap / router ARP
   ssh_collector.py   SSH + local-shell collection; auto-detects local machine IPs
-  risk_engine.py     Scoring rules → Finding objects
+  distro_eol.py      OS end-of-life database; distro-specific upgrade steps and package manager helpers
+  risk_engine.py     Scoring rules → Finding objects; all remediation tailored to detected distro
   sbom.py            SBOM collection, parsing, per-host DuckDB storage, DuckLake catalog
   vuln_db.py         Vulnerability cache — OSV + CISA KEV, local DuckDB at ~/.cache/ohshit/vuln.duckdb
   port_probe.py      Deep port banner / TLS / ESPHome probing

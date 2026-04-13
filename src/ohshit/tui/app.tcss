@@ -137,6 +137,15 @@ HostListItem > Horizontal {
 .badge-low      { background: $success; color: $text; }
 .badge-info     { background: $accent; color: $text; }
 
+/* EOL badge on host list items */
+.eol-badge {
+    width: auto;
+    padding: 0 1;
+}
+.eol-badge-critical { background: $error; color: $text; text-style: bold; }
+.eol-badge-high     { background: $warning; color: $text; text-style: bold; }
+.eol-badge-medium   { background: $warning-lighten-2; color: $text-muted; }
+
 /* Host detail panel */
 #detail-header {
     background: $surface;
@@ -147,6 +156,11 @@ HostListItem > Horizontal {
 
 #detail-os, #detail-kernel, #detail-mac, #detail-ssh, #detail-seen, #detail-vendor, #detail-iot, #detail-esphome {
     padding: 0 1;
+}
+
+#detail-eol {
+    padding: 0 1;
+    margin-bottom: 0;
 }
 
 #detail-seen {
@@ -176,6 +190,21 @@ HostListItem > Horizontal {
 
 .remed-step {
     color: $success;
+    padding: 0 2;
+}
+
+.remed-note {
+    color: $text-muted;
+    padding: 0 2;
+}
+
+.remed-blank {
+    height: 1;
+}
+
+.remed-evidence {
+    color: $text-muted;
+    text-style: italic dim;
     padding: 0 2;
 }
 
