@@ -24,6 +24,25 @@ RAW_COMMANDS: dict[str, str] = {
     "docker_ps":        "docker ps -a 2>/dev/null || true",
     "docker_images":    "docker images 2>/dev/null || true",
     "apt_upgradable":   "apt list --upgradable 2>/dev/null || true",
+    # Last package upgrade timestamp — tries multiple log sources in priority order:
+    #   1. dpkg.log (apt/dpkg on Debian/Ubuntu): last 'upgrade' or 'install' action
+    #   2. dnf.log (Fedora/RHEL 8+): last 'Upgrade' transaction
+    #   3. yum.log (older RHEL/CentOS): last 'Updated:' line
+    #   4. /var/log/apk (Alpine): mtime of apk world file
+    #   5. zypper.log (openSUSE): last 'install' transaction
+    # Emits a single Unix timestamp (seconds) or nothing.
+    "last_pkg_upgrade": (
+        "{ "
+        "grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} (upgrade|install) ' "
+        "  /var/log/dpkg.log 2>/dev/null | tail -1 | awk '{print $1\"T\"$2}' ; "
+        "grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}' "
+        "  /var/log/dnf.log 2>/dev/null | tail -1 ; "
+        "tail -1 /var/log/yum.log 2>/dev/null | awk '{print $1,$2,$3}' ; "
+        "stat -c '%Y' /var/lib/apk/world 2>/dev/null ; "
+        "grep -oE '[A-Z][a-z]{2} [A-Z][a-z]{2} [ 0-9][0-9] [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}' "
+        "  /var/log/zypper.log 2>/dev/null | tail -1 ; "
+        "} 2>/dev/null | head -1 || true"
+    ),
     # SBOM collection commands
     "sbom_dpkg":        "dpkg-query -W -f=$'${Package}\\t${Version}\\t${Architecture}\\n' 2>/dev/null || true",
     "sbom_dpkg_dates":  "stat -c $'%n\\t%Y' /var/lib/dpkg/info/*.md5sums 2>/dev/null || true",
@@ -145,6 +164,9 @@ def _apply_os_release(host: Host, raw: dict) -> None:
             host.os_release = parsed
             host.os_guess = host.os_guess or parsed.get("PRETTY_NAME") or parsed.get("NAME")
 
+    # Parse last package upgrade timestamp
+    host.last_pkg_upgrade = _parse_last_upgrade(raw.get("last_pkg_upgrade", ""))
+
     # Parse ss/netstat listening ports into open_ports.
     # Keep nmap-discovered ports for any port ss doesn't report (e.g. UDP).
     ss_ports = _parse_ss_ports(raw.get("listening_ports", ""))
@@ -152,6 +174,43 @@ def _apply_os_release(host: Host, raw: dict) -> None:
         # Merge: ss wins for TCP (it has process names); keep existing non-TCP ports
         existing_non_tcp = [p for p in host.open_ports if p.protocol != "tcp"]
         host.open_ports = ss_ports + existing_non_tcp
+
+
+def _parse_last_upgrade(raw: str) -> "datetime | None":
+    """Parse the output of the last_pkg_upgrade command into a datetime.
+
+    Handles these formats produced by the RAW_COMMANDS entry:
+      - "2024-03-15T14:22:01"   (dpkg.log / dnf.log ISO format)
+      - "1710508921"            (Unix timestamp from stat, e.g. Alpine apk world)
+      - "Mar 15 14:22:01 2024" (yum.log / zypper.log)
+    """
+    from datetime import datetime
+    s = raw.strip()
+    if not s:
+        return None
+
+    # ISO datetime: 2024-03-15T14:22:01 or 2024-03-15 14:22:01
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(s[:19], fmt)
+        except ValueError:
+            pass
+
+    # Unix timestamp (digits only, reasonable range)
+    if s.isdigit() and 1_000_000_000 < int(s) < 9_999_999_999:
+        try:
+            return datetime.fromtimestamp(int(s))
+        except (OSError, OverflowError):
+            pass
+
+    # yum.log / zypper.log: "Mar 15 14:22:01 2024" or "Sat Mar 15 14:22:01 2024"
+    for fmt in ("%b %d %H:%M:%S %Y", "%a %b %d %H:%M:%S %Y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            pass
+
+    return None
 
 
 def _parse_ss_ports(ss_output: str) -> list[PortInfo]:

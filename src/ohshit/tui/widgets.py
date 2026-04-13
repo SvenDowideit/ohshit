@@ -258,6 +258,7 @@ class HostDetailTab(Widget):
         yield Label("", id="detail-mac")
         yield Label("", id="detail-ssh")
         yield Label("", id="detail-seen")
+        yield Label("", id="detail-last-upgrade")
         yield Label("", id="detail-vendor")
         yield Label("", id="detail-iot")
         yield Label("", id="detail-repurpose")
@@ -281,7 +282,7 @@ class HostDetailTab(Widget):
                 "← Select a host from the list to see details"
             )
             for wid in ("detail-os", "detail-eol", "detail-kernel", "detail-mac", "detail-ssh",
-                        "detail-seen", "detail-vendor", "detail-iot", "detail-repurpose",
+                        "detail-seen", "detail-last-upgrade", "detail-vendor", "detail-iot", "detail-repurpose",
                         "detail-esphome", "detail-vuln-summary"):
                 self.query_one(f"#{wid}", Label).update("")
             self.query_one("#ports-table", DataTable).clear(columns=False)
@@ -350,6 +351,28 @@ class HostDetailTab(Widget):
         if host.last_scan:
             seen_parts.append(f"last scanned {_fmt_ts(host.last_scan)}")
         self.query_one("#detail-seen", Label).update("  |  ".join(seen_parts))
+
+        # Last package upgrade time
+        upgrade_lbl = self.query_one("#detail-last-upgrade", Label)
+        if host.os_release and host.last_pkg_upgrade:
+            ago_str = _ago(host.last_pkg_upgrade)
+            ts_str = _fmt_ts(host.last_pkg_upgrade)
+            now = datetime.now(timezone.utc) if host.last_pkg_upgrade.tzinfo else datetime.now()
+            days_ago = (now - host.last_pkg_upgrade).days
+            if days_ago > 90:
+                style = "bold black on yellow"
+                warn = "  (!)"
+            else:
+                style = "dim"
+                warn = ""
+            upgrade_lbl.update(
+                Text(f"Last pkg upgrade: {ago_str}  ({ts_str}){warn}", style=style)
+            )
+        elif host.os_release:
+            # Linux host but no upgrade data collected yet
+            upgrade_lbl.update(Text("Last pkg upgrade: unknown", style="dim"))
+        else:
+            upgrade_lbl.update("")
 
         # IoT vendor / device type + MAC permanence
         iot = host.iot_info

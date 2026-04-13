@@ -106,6 +106,7 @@ class Host:
     first_seen: datetime = field(default_factory=datetime.now)
     last_seen: datetime = field(default_factory=datetime.now)
     last_scan: datetime | None = None
+    last_pkg_upgrade: datetime | None = None
 
     # IoT passive detection
     iot_info: IotInfo = field(default_factory=IotInfo)

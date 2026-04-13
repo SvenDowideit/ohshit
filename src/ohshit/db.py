@@ -61,7 +61,8 @@ _SCHEMA_STATEMENTS = [
     ssh_error       TEXT,
     first_seen      TIMESTAMPTZ NOT NULL,
     last_seen       TIMESTAMPTZ NOT NULL,
-    last_scan       TIMESTAMPTZ
+    last_scan       TIMESTAMPTZ,
+    last_pkg_upgrade TIMESTAMPTZ
 )""",
     """CREATE TABLE IF NOT EXISTS mac_history (
     id          TEXT PRIMARY KEY,
@@ -145,6 +146,7 @@ _SCHEMA_STATEMENTS = [
 _MIGRATIONS = [
     ("iot_info", "mac_permanence",    "TEXT"),
     ("iot_info", "esphome_info_json", "TEXT"),
+    ("hosts",    "last_pkg_upgrade",  "TIMESTAMPTZ"),
 ]
 
 
@@ -193,8 +195,8 @@ def upsert_host(con: duckdb.DuckDBPyConnection, host: Host) -> None:
         INSERT INTO hosts
             (ip, mac, hostname, state, os_guess, kernel_version,
              os_release_json, services_json, ssh_error,
-             first_seen, last_seen, last_scan)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             first_seen, last_seen, last_scan, last_pkg_upgrade)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (ip) DO UPDATE SET
             mac             = COALESCE(excluded.mac, hosts.mac),
             hostname        = COALESCE(excluded.hostname, hosts.hostname),
@@ -207,7 +209,8 @@ def upsert_host(con: duckdb.DuckDBPyConnection, host: Host) -> None:
             services_json   = excluded.services_json,
             ssh_error       = excluded.ssh_error,
             last_seen       = excluded.last_seen,
-            last_scan       = excluded.last_scan
+            last_scan       = excluded.last_scan,
+            last_pkg_upgrade = COALESCE(excluded.last_pkg_upgrade, hosts.last_pkg_upgrade)
     """, [
         host.ip,
         host.mac,
@@ -221,6 +224,7 @@ def upsert_host(con: duckdb.DuckDBPyConnection, host: Host) -> None:
         host.first_seen,
         now,
         host.last_scan or now,
+        host.last_pkg_upgrade,
     ])
 
     # MAC history — record every new (mac, ip) pair we observe
@@ -344,7 +348,7 @@ def load_all_hosts(con: duckdb.DuckDBPyConnection) -> dict[str, Host]:
     rows = con.execute("""
         SELECT ip, mac, hostname, state, os_guess, kernel_version,
                os_release_json, services_json, ssh_error,
-               first_seen, last_seen, last_scan
+               first_seen, last_seen, last_scan, last_pkg_upgrade
         FROM hosts
         ORDER BY ip
     """).fetchall()
@@ -353,7 +357,7 @@ def load_all_hosts(con: duckdb.DuckDBPyConnection) -> dict[str, Host]:
     for row in rows:
         (ip, mac, hostname, state, os_guess, kernel_version,
          os_release_json, services_json, ssh_error,
-         first_seen, last_seen, last_scan) = row
+         first_seen, last_seen, last_scan, last_pkg_upgrade) = row
         h = Host(
             ip=ip,
             mac=mac,
@@ -367,6 +371,7 @@ def load_all_hosts(con: duckdb.DuckDBPyConnection) -> dict[str, Host]:
             first_seen=first_seen or datetime.now(),
             last_seen=last_seen or datetime.now(),
             last_scan=last_scan,
+            last_pkg_upgrade=last_pkg_upgrade,
         )
         hosts[ip] = h
 
