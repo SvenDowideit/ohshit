@@ -45,7 +45,7 @@ from textual.widgets import Button, Footer, Header, Label, TabbedContent, TabPan
 from .. import db as DB
 from ..discovery import discover_all, tcp_port_scan
 from ..iot import detect_iot, passive_network_scan
-from ..models import Host, IotInfo, ScanResult, Severity
+from ..models import Host, HostState, IotInfo, ScanResult, Severity
 from ..port_probe import probe_ports
 from ..report import generate_markdown_report
 from ..risk_engine import RiskEngine
@@ -82,6 +82,7 @@ class OhShitApp(App[None]):
         Binding("r", "rescan_all", "Re-scan All", show=True),
         Binding("s", "rescan_selected", "Re-scan Host", show=True),
         Binding("b", "collect_sbom", "Collect SBOM", show=True),
+        Binding("B", "collect_sbom_all", "Collect SBOM All", show=True),
         Binding("v", "query_vulns", "Query Vulns", show=True),
         Binding("V", "refresh_all_vulns", "Refresh All Vulns", show=True),
         Binding("e", "export_report", "Export Report", show=True),
@@ -525,6 +526,49 @@ class OhShitApp(App[None]):
                 DB.data_changed.set()
 
         threading.Thread(target=_sbom_thread, daemon=True, name="ohshit-sbom").start()
+
+    def action_collect_sbom_all(self) -> None:
+        """Force SBOM collection for all SSH-reachable hosts."""
+        ssh_states = {HostState.SSH_SUCCESS, HostState.LOCAL}
+        targets = [h for h in self._hosts.values() if h.state in ssh_states]
+        if not targets:
+            self._log("[yellow]No SSH-reachable hosts to collect SBOM from.[/yellow]")
+            return
+        total = len(targets)
+        self._log(f"[cyan]Collecting SBOM for {total} host(s)…[/cyan]")
+
+        db_path = self._db_path
+        sbom_base = db_path.parent
+
+        def _sbom_all_thread() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                async def _run_all() -> None:
+                    for idx, host in enumerate(targets):
+                        pct = int(idx / total * 100)
+                        self._thread_safe_progress(
+                            f"SBOM {idx + 1}/{total}: {host.display_name}", pct
+                        )
+                        try:
+                            await _collect_sbom_only(
+                                host=host,
+                                db_path=db_path,
+                                sbom_base=sbom_base,
+                                log_cb=self._thread_safe_log,
+                            )
+                        except Exception as exc:
+                            self._thread_safe_log(
+                                f"[bold red]SBOM error {host.display_name}:[/bold red] {exc}"
+                            )
+                        DB.data_changed.set()
+                    self._thread_safe_progress("SBOM collection complete", 100)
+                loop.run_until_complete(_run_all())
+            finally:
+                loop.close()
+                DB.data_changed.set()
+
+        threading.Thread(target=_sbom_all_thread, daemon=True, name="ohshit-sbom-all").start()
 
     def action_query_vulns(self) -> None:
         """Query OSV for vulnerabilities matching the selected host's SBOM packages."""

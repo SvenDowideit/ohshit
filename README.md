@@ -20,7 +20,7 @@ steps, and a full Software Bill of Materials (SBOM) for every host.
 │────────────────────────────────────────────────────────────────────────│
 │ [SSH: myserver]                                              [████  80%]│
 │ 14:32:07 Discovery done: 8 hosts found                                  │
-└────────── r:Re-scan  s:Re-scan host  b:SBOM  v:Vulns  e:Export  q:Quit ┘
+└────────── r:Re-scan  s:Re-scan host  b:SBOM  B:SBOM All  v:Vulns  e:Export  q:Quit ┘
 ```
 
 ## Quick start
@@ -302,6 +302,7 @@ The Textual TUI refreshes as data arrives:
 | `r` | Re-scan all hosts |
 | `s` | Re-scan the selected host |
 | `b` | Collect SBOM for the selected host only (local shell or SSH; bypasses 24 h age check) |
+| `B` | Collect SBOM for **all** SSH-reachable hosts |
 | `v` | Show vulnerability data for the selected host — reads from local cache instantly; only fetches from OSV if no cache exists yet |
 | `V` | Force-download fresh KEV + OSV data for **all** hosts with an SBOM, then update every host's risk score |
 | `e` | Export Markdown report to `~/network-security-report-<timestamp>.md` |
